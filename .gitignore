@@ -1,0 +1,21 @@
+__pycache__/
+schedule/
+.vscode/
+dm_cache/
+
+*.log
+*.whl
+*.png
+*.pyc
+nohup.out
+
+*.gz
+*.txt
+
+# logs & artifacts
+wandb/
+outputs/
+*.json
+
+valid_log/
+.history/

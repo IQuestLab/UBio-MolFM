@@ -1,0 +1,24 @@
+num_layers: 6
+# irreps_node_embedding: "128x0e+64x1e+32x2e"
+# irreps_head: "32x0e+16x1e+8x2e"
+irreps_node_embedding: "128x0e+128x1e"
+irreps_head: "32x0e+32x1e"
+num_heads: 4
+# irreps_node_attr: "1x0e"
+irreps_sh: "1x0e+1x1e"
+# irreps_sh: "1x0e+1x1e"
+max_radius: 5.0
+number_of_basis: 128
+attn_weight_input_dim: 128
+basis_type: "gaussian"
+fc_neurons: [64 , 64]
+irreps_pre_attn: null
+rescale_degree: False
+nonlinear_message: False
+norm_layer: "layer"
+alpha_drop: 0.2
+proj_drop: 0.0
+out_drop: 0.0
+drop_path_rate: 0.0
+internal_weights: False
+attn_weight: False

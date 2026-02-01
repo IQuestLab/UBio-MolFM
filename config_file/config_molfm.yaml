@@ -1,0 +1,15 @@
+defaults:
+- config_molfm_schema
+- backbone_config: e2former
+# - schedule: polynomial #'cosine', 'reduce_on_plateau','polynomial'
+# - data_module: default
+- strategy_config: single
+- _self_
+- scheduler_config: groupWarmupDecayLR
+
+
+# early stopping
+early_stopping: False
+early_stopping_patience: 10
+early_stopping_metric: "loss" # get loss after validation
+early_stopping_mode: "min"

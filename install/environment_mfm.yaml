@@ -1,0 +1,60 @@
+name: mfm_test
+channels:
+  - conda-forge
+  - defaults
+  - pyscf
+dependencies:
+  - python=3.12.*
+  - pybind11
+  - pytest
+  - pip
+  - loguru
+  - peft
+  - python-lmdb
+  - tensorboard
+  - lmdb
+  - orjson
+  - submitit
+  - numpy
+  - geometric=1.0
+  - pyscf>2.4
+  - qcelemental=0.27.1
+  - qcengine=0.29.0
+  - libblas=*=*mkl
+  - numba
+  - scipy=1.11.3
+  - vmd-python
+  - openbabel
+  - mdanalysis
+  - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cu126
+      - torch==2.7.0+cu126
+      - torchvision==0.22.0+cu126
+      - torchaudio==2.7.0+cu126
+      - deepspeed
+      - triton
+      - hydra-core
+      - e3nn
+      - aim
+      - ase_db_backends
+      - wandb==0.21.0
+      - nequip-allegro==0.7.0
+      - build
+      - cupy-cuda12x
+      - aiofiles
+      - rdkit
+      - networkx
+      - joblib
+      - tqdm
+      - mlflow
+      - ase
+      - pymatgen
+      - torchtnt
+      - swanlab
+      - --find-links https://data.pyg.org/whl/torch-2.7.0+cu126.html
+      - torch-geometric==2.5.3
+      - pyg_lib
+      - torch_scatter
+      - torch_sparse
+      - torch_cluster
+      - torch_spline_conv

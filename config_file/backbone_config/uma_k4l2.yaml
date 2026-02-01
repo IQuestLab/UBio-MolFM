@@ -1,0 +1,32 @@
+name: uma
+max_num_elements: 100
+sphere_channels: 128
+lmax: 2
+mmax: 2
+
+otf_graph: True
+max_neighbors: 20
+use_pbc: True
+use_pbc_single: True
+
+cutoff: 6
+edge_channels: 128
+distance_function: gaussian
+num_distance_basis: 64
+
+regress_forces: True
+regress_stress: False
+direct_forces: True
+
+num_layers: 4
+hidden_channels: 128
+norm_type: rms_norm_sh
+act_type: gate
+ff_type: spectral
+
+chg_spin_emb_type: "rand_emb"
+cs_emb_grad: True
+dataset_list: [omol25]
+
+
+use_dataset_embedding: False

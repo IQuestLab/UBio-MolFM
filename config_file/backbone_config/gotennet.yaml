@@ -1,0 +1,24 @@
+name: gotennet
+n_atom_basis: 256
+n_interactions: 4
+n_rbf: 32
+cutoff: 5.0
+radial_basis: "expnorm"
+activation: "swish"
+max_z: 100
+weight_init: "xavier_uniform"
+bias_init: "zeros"
+num_heads: 8
+attn_dropout: 0.1
+edge_updates: True
+lmax: 2
+aggr: "add"
+scale_edge: False
+evec_dim:
+emlp_dim:
+sep_htr: True
+sep_dir: True
+sep_tensor: True
+edge_ln: ""
+layernorm: "norm"
+steerable_norm: "norm"

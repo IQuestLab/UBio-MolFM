@@ -1,0 +1,13 @@
+order: 4
+vecnorm_type: 'max_min'
+trainable_vecnorm: false
+num_heads: 8
+num_layers: 6
+embedding_dimension: 128
+num_rbf: 32
+trainable_rbf: false
+max_z: 100
+max_radius: 5.0
+max_num_neighbors: 32
+vertex: false
+load_pretrain: ''

@@ -1,0 +1,34 @@
+name: e2former
+
+
+# dit_config
+encoder_embed_dim: 1024
+ffn_embedding_dim: 1536
+num_attention_heads: 32
+dropout: 0.1
+num_encoder_layers: 12
+
+pbc_expanded_token_cutoff: 256
+pbc_expanded_num_cell_per_direction: 4
+
+
+
+# backbone_config:
+num_layers: 4
+irreps_node_embedding: "256x0e+256x1e+256x2e"
+irreps_head: "2x0e+2x1e+2x2e"
+attn_scalar_head: 8
+num_attn_heads: 128
+number_of_basis: 256
+pbc_max_radius: 4.5
+max_radius: 4.5
+max_neighbors: 32
+alpha_drop: 0
+basis_type: 'gaussiansmear'
+norm_layer: 'rms_norm_sh'
+attn_type: 'so2-first-order'
+tp_type: 'QK_alpha+triton'
+edge_embedtype: 'default'
+ffn_type: 's3'
+encoder: "default" # or dit
+with_cluster: false
