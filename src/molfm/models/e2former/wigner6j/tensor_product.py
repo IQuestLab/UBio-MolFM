@@ -21,9 +21,10 @@ from e3nn.util.jit import compile_mode
 from opt_einsum_fx import optimize_einsums_full
 from sympy.physics.wigner import wigner_6j
 from torch import fx
+from loguru import logger
 
 from ..module_utils import SO3_Linear_e2former
-from ..tensor_product import Simple_TensorProduct_oTchannel, _sum_tensors, slices_basis
+from .base_tensor_product import Simple_TensorProduct_oTchannel, _sum_tensors, slices_basis
 
 
 class DepthWiseTensorProduct_reducesameorder(Simple_TensorProduct_oTchannel):
@@ -254,7 +255,7 @@ def CODEGEN_MAIN_LEFT_RIGHT(
     self__simulate_tp,
     self__info,
 ) -> fx.GraphModule:
-
+    
     graph = fx.Graph()
 
     # = Function definitions =
@@ -274,6 +275,7 @@ def CODEGEN_MAIN_LEFT_RIGHT(
     # )[0].shape
     del empty
 
+    
     # x1s, x2s = x1s.broadcast_to(output_shape + (-1,-1)), x2s.broadcast_to(
     #     output_shape + (-1,-1)
     # )
@@ -287,6 +289,7 @@ def CODEGEN_MAIN_LEFT_RIGHT(
     # x2s = x2s.reshape(output_shape.numel(), -1, self__irreps_in2[0].mul)
     batch_numel = x1s.shape[0]
 
+    
     x1_list = [
         x1s[:, i].reshape(batch_numel, mul_ir.ir.dim, mul_ir.mul)
         for i, mul_ir in zip(slices_basis(self__irreps_in1), self__irreps_in1)
@@ -299,11 +302,13 @@ def CODEGEN_MAIN_LEFT_RIGHT(
     outputs = []
     flat_weight_index = 0
 
+    
     for idx, ins in enumerate(self__instructions):
         mul_ir_in1 = self__irreps_in1[ins.i_in1]
         mul_ir_in2 = self__irreps_in2[ins.i_in2]
         mul_ir_out = self__irreps_out[ins.i_out]
 
+        
         # if mul_ir_in1.dim == 0 or mul_ir_in2.dim == 0 or mul_ir_out.dim == 0:
         #     continue
 
@@ -330,6 +335,7 @@ def CODEGEN_MAIN_LEFT_RIGHT(
                 ].reshape(tuple(ins.path_shape))
 
             flat_weight_index += prod(ins.path_shape)
+        
         # w = weights[
         #     :, flat_weight_index : flat_weight_index + prod(ins.path_shape)
         # ].reshape((-1,) + tuple(ins.path_shape))
@@ -350,6 +356,7 @@ def CODEGEN_MAIN_LEFT_RIGHT(
             else:
                 result = torch.einsum("ziu,zjv,ijk->zku", x1, x2, w3j)
 
+        
         # result = torch.einsum("zuv,ijk,zuvij->zuk", w, w3j, xx)
 
         result = ins.path_weight * result
@@ -371,6 +378,7 @@ def CODEGEN_MAIN_LEFT_RIGHT(
                     mul_ir_in1.ir.l, mul_ir_in2.ir.l, mul_ir_out.ir.l
                 )
 
+    
     outputs = [
         _sum_tensors(
             [
@@ -549,12 +557,14 @@ class FullyConnectedTensorProductWigner6j(Simple_TensorProduct_oTchannel):
         self._codegen_register({"_compiled_main_left_right": graphmod_left_right})
 
     def _main_left_right(self, x1s, x2s, weights):
+        
         empty = torch.empty((), device="cpu")
         output_shape = torch.broadcast_tensors(
             empty.expand(x1s.shape[:-2]), empty.expand(x2s.shape[:-2])
         )[0].shape
         del empty
 
+        
         x1s, x2s = x1s.broadcast_to(output_shape + (-1, -1)), x2s.broadcast_to(
             output_shape + (-1, -1)
         )
@@ -563,6 +573,7 @@ class FullyConnectedTensorProductWigner6j(Simple_TensorProduct_oTchannel):
         x2s = x2s.reshape(output_shape.numel(), -1, self.irreps_in2[0].mul)
         batch_numel = x1s.shape[0]
 
+        
         x1_list = [
             x1s[:, i].reshape(batch_numel, mul_ir.ir.dim, mul_ir.mul)
             for i, mul_ir in zip(slices_basis(self.irreps_in1), self.irreps_in1)
@@ -575,17 +586,20 @@ class FullyConnectedTensorProductWigner6j(Simple_TensorProduct_oTchannel):
         outputs = []
         flat_weight_index = 0
 
+        
         for idx, ins in enumerate(self.instructions):
             mul_ir_in1 = self.irreps_in1[ins.i_in1]
             mul_ir_in2 = self.irreps_in2[ins.i_in2]
             mul_ir_out = self.irreps_out[ins.i_out]
 
+            
             # if mul_ir_in1.dim == 0 or mul_ir_in2.dim == 0 or mul_ir_out.dim == 0:
             #     continue
 
             x1 = x1_list[ins.i_in1]
             x2 = x2_list[ins.i_in2]
 
+            
             w3j = o3.wigner_3j(mul_ir_in1.ir.l, mul_ir_in2.ir.l, mul_ir_out.ir.l).to(
                 x1s.device
             )
@@ -605,6 +619,7 @@ class FullyConnectedTensorProductWigner6j(Simple_TensorProduct_oTchannel):
                     ].reshape((1,) + tuple(ins.path_shape))
 
                 flat_weight_index += prod(ins.path_shape)
+            
             # w = weights[
             #     :, flat_weight_index : flat_weight_index + prod(ins.path_shape)
             # ].reshape((-1,) + tuple(ins.path_shape))
@@ -625,6 +640,7 @@ class FullyConnectedTensorProductWigner6j(Simple_TensorProduct_oTchannel):
                 else:
                     result = torch.sum(xx, dim=-1)
 
+            
             # result = torch.einsum("zuv,ijk,zuvij->zuk", w, w3j, xx)
 
             result = ins.path_weight * result
@@ -632,6 +648,7 @@ class FullyConnectedTensorProductWigner6j(Simple_TensorProduct_oTchannel):
                 result.reshape(batch_numel, mul_ir_out.ir.l * 2 + 1, mul_ir_out.mul)
             )
 
+        
         # for i in outputs:print(i.shape)
         outputs = [
             _sum_tensors(
@@ -743,26 +760,26 @@ def get_tp_e3nnsh_diff():
     )
     Y_6 = self__6_tp(Y_5, Y)  # batch_size \times m time 5
 
-    print(
-        Y_sq
-        / (e3nn.o3.spherical_harmonics(2, Y, normalize=False, normalization="integral"))
-    )  # 1.29441716
-    print(
-        Y_tr
-        / (e3nn.o3.spherical_harmonics(3, Y, normalize=False, normalization="integral"))
-    )  # 0.84739512
-    print(
-        Y_4
-        / (e3nn.o3.spherical_harmonics(4, Y, normalize=False, normalization="integral"))
-    )  # 0.56493002
-    print(
-        Y_5
-        / (e3nn.o3.spherical_harmonics(5, Y, normalize=False, normalization="integral"))
-    )  # 0.38087577
-    print(
-        Y_6
-        / (e3nn.o3.spherical_harmonics(6, Y, normalize=False, normalization="integral"))
-    )  # 0.25875416
+    logger.info(
+        "Y_2 ratio: {}",
+        Y_sq / (e3nn.o3.spherical_harmonics(2, Y, normalize=False, normalization="integral")),
+    )
+    logger.info(
+        "Y_3 ratio: {}",
+        Y_tr / (e3nn.o3.spherical_harmonics(3, Y, normalize=False, normalization="integral")),
+    )
+    logger.info(
+        "Y_4 ratio: {}",
+        Y_4 / (e3nn.o3.spherical_harmonics(4, Y, normalize=False, normalization="integral")),
+    )
+    logger.info(
+        "Y_5 ratio: {}",
+        Y_5 / (e3nn.o3.spherical_harmonics(5, Y, normalize=False, normalization="integral")),
+    )
+    logger.info(
+        "Y_6 ratio: {}",
+        Y_6 / (e3nn.o3.spherical_harmonics(6, Y, normalize=False, normalization="integral")),
+    )
 
 
 class E2TensorProductArbitraryOrder_woequal(torch.nn.Module):
@@ -1502,3 +1519,53 @@ class E2TensorProductArbitraryOrder(torch.nn.Module):
         out_new = self.tensor_product_tp_component_1(h_new, delta_pos_order_l)
         out_new = torch.sum(out_new, dim=1)
         return out_new * self.path_norm
+
+if __name__ == '__main__':
+    import torch
+
+
+    for o in range(1, 4):
+        head, hidden = 8, 16
+        f_N1, f_N2 = 7, 8
+        alpha_ij = torch.randn(f_N1, f_N2, head)
+        h = torch.randn(f_N1, (o + 1) ** 2, head * hidden)
+        exp_h = torch.randn(f_N2, (o + 1) ** 2, head * hidden)
+        pos = torch.randn(f_N1, 3)
+        exp_pos = torch.randn(f_N2, 3)
+
+        irreps_in = "+".join(
+            [
+                f"{head*hidden}x0e",
+                f"{head*hidden}x1e",
+                f"{head*hidden}x2e",
+                f"{head*hidden}x3e",
+                f"{head*hidden}x4e",
+            ][: o + 1]
+        )
+        irreps_out = irreps_in
+
+        learnable_weight = True
+        connection_mode = "uvw"
+
+        # Test arbitrary order with second order case
+        model_arbitrary = E2TensorProductArbitraryOrder(
+            irreps_in,
+            irreps_out,
+            head,
+            order=o,
+            learnable_weight=learnable_weight,
+            connection_mode=connection_mode,
+            path_normalization="element",
+        )
+        out_arbitrary = model_arbitrary(pos, exp_pos, h, exp_h, alpha_ij)
+
+        out_second = model_arbitrary.vanilla_forward(pos, exp_pos, h, exp_h, alpha_ij)
+        # Print comparison metrics
+        diff = out_arbitrary / out_second
+        logger.info(
+            "Comparing Arbitrary Order (n={}) vs Second Order | max={:.8f} | mean={:.8f} | min={:.8f}",
+            o,
+            torch.max(diff),
+            torch.mean(diff),
+            torch.min(diff),
+        )

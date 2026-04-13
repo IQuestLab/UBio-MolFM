@@ -1,0 +1,3 @@
+warmup_steps: 4000
+warmup_factor: 0.2
+lr_min_factor: 0.01

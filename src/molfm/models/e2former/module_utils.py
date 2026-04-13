@@ -1,29 +1,744 @@
 # -*- coding: utf-8 -*-
 import logging
 import math
+from multiprocessing.dummy import current_process
+from typing import List
 import warnings
 
 import e3nn
 import numpy as np
 import scipy.special as sp
 import torch
-from e3nn import o3
-from e3nn.util.jit import compile_mode
-from fairchem.core.models.equiformer_v2.activation import GateActivation
-from fairchem.core.models.equiformer_v2.so3 import (
-    CoefficientMappingModule,
-    FromS2Grid,
-    SO3_LinearV2,
-    ToS2Grid,
-)
-from fairchem.core.models.escn.so3 import SO3_Embedding
+
+
 from torch import nn
 from torch_cluster import radius_graph
 from torch_geometric.data import Data
+from torch.profiler import record_function
 
-from .tensor_product import Simple_TensorProduct
 
-# from fairchem.core.models.escn.so3 import SO3_Grid
+from e3nn import o3
+from e3nn.util.jit import compile_mode
+from e3nn.o3 import FromS2Grid, ToS2Grid
+
+
+from molfm.models.e2former.maceblocks import NonLinearDipoleReadoutBlock
+from .triton_dr.triton_sparse_qk_autograd import prepare_sparse_qk_edge_index_metadata
+
+
+from .wigner6j.base_tensor_product import Simple_TensorProduct
+
+from loguru import logger
+import torch
+from torch import logical_not, nn
+
+import torch, torch.nn as nn, re
+from torch.optim import AdamW, Adam
+
+import torch.nn as nn
+from typing import Optional
+
+def build_param_groups(
+    model: nn.Module,
+    base_lr: float,
+    weight_decay: float,
+    custom_factors: Optional[list[tuple[str, float]]] = None,
+):
+    """
+    custom_factors: 
+        e.g. [("svp", 10.0), ("tzvpd", 30.0)]
+
+    """
+    model = model.module if hasattr(model, "module") else model
+
+    no_decay_types = (
+        nn.LayerNorm,
+        nn.BatchNorm1d,
+        nn.BatchNorm2d,
+        nn.BatchNorm3d,
+        nn.GroupNorm,
+        EquivariantRMSNormArraySphericalHarmonicsV2_BL,
+    )
+    no_decay_name_substr = (
+        "bias",
+        "embedding",
+        "pos_embed",
+        "relative_position_bias",
+    )
+
+    def is_no_decay(name, module, param):
+        if param.ndim == 1:  
+            return True
+        if isinstance(module, no_decay_types):
+            return True
+        if any(k in name for k in no_decay_name_substr):
+            return True
+        return False
+
+    # key: ("decay" or "no_decay", lr_mult) -> [params...]
+    groups: dict[tuple[str, float], list] = {}
+
+    for mod_name, module in model.named_modules():
+        for p_name, p in module.named_parameters(recurse=False):
+            if not p.requires_grad:
+                continue
+
+            full = f"{mod_name}.{p_name}" if mod_name else p_name
+            nd = is_no_decay(full, module, p)
+
+            
+            lr_mult = 1.0
+            
+            if custom_factors is not None:
+                for key_substr, factor in custom_factors:
+                    if key_substr in full:
+                        lr_mult = float(factor)
+                        break
+
+            kind = "no_decay" if nd else "decay"
+            gkey = (kind, lr_mult)
+            groups.setdefault(gkey, []).append(p)
+
+    
+    param_groups = []
+    for (kind, lr_mult), params in groups.items():
+        if not params:
+            continue
+        wd = 0.0 if kind == "no_decay" else weight_decay
+        param_groups.append(
+            {
+                "params": params,
+                "lr": base_lr * lr_mult,
+                "weight_decay": wd,
+            }
+        )
+
+    return param_groups
+
+
+def scaled_sigmoid(x, N, k=1.0):
+    """
+    Map the input x (an integer between 0 and N) to the interval [0, 1], approaching 0 near 0 and approaching 1 near N, similar to a sigmoid function. 
+    Parameters:
+        x: Tensor, input value, should be within the range [0, N]
+        N: float or int, maximum value
+        k: float, controls the steepness of the curve, the larger the k, the steeper the curve (default 1.0) 
+    Return:
+        Tensor with the same shape as x, and values within the range [0, 1]
+    """
+    
+    x_norm = x / N  
+    
+    
+    return torch.sigmoid(k * (x_norm - 0.5))  
+
+
+class sph_fromxyz(torch.nn.Module):
+    def __init__(self, lmax = 2, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.lmax = lmax
+
+        rt5, rt15 = math.sqrt(5.0), math.sqrt(15.0)
+        W = torch.zeros(5, 9)
+        # sh_2_0
+        W[0, 2] =  rt15             # xz
+        # sh_2_1
+        W[1, 1] =  rt15             # xy
+        # sh_2_2
+        W[2, 4] =  rt5              # + y^2
+        W[2, 0] = -0.5 * rt5        # - 0.5*x^2
+        W[2, 8] = -0.5 * rt5        # - 0.5*z^2
+        # sh_2_3
+        W[3, 5] =  rt15             # yz
+        # sh_2_4
+        W[4, 8] =  0.5 * rt15       # + 0.5*z^2
+        W[4, 0] = -0.5 * rt15       # - 0.5*x^2
+        self.W = torch.nn.Parameter(W.t(),requires_grad=False)
+    def forward(self,vec):
+        """
+        vec: (..., 3)   x,y,z
+        return: (..., 5)   [sh_2_0, sh_2_1, sh_2_2, sh_2_3, sh_2_4]
+        """
+        assert vec.shape[-1] == 3
+        if self.lmax == 0:
+            return 
+        elif self.lmax == 1:
+            return torch.cat([torch.ones_like(vec[...,:1]), math.sqrt(3)*vec],dim = -1)
+        elif self.lmax == 2:
+            
+            
+            outer = vec[..., :, None] * vec[..., None, :]        # (...,3,3)
+            feat  = outer.reshape(*vec.shape[:-1], 9)            # (...,9)
+
+            sh_l2 = feat @ self.W
+            return torch.cat([torch.ones_like(vec[...,:1]), math.sqrt(3)*vec,sh_l2],dim = -1)
+        else:
+            raise ValueError
+
+
+# follow fairchem 2.4.0 and e3nn 0.4.0
+# quick fix: for some special case e.g. [0,0,0],[0,1,0],[0,x,0]
+@torch.compiler.disable
+def init_edge_rot_euler_angles(edge_distance_vec,training = True,ts = 0.00001):
+    edge_vec_0 = edge_distance_vec
+    edge_vec_0_distance = torch.norm(edge_vec_0,dim = 1) #torch.sqrt(torch.sum(edge_vec_0**2, dim=1))
+
+    # Make sure the atoms are far enough apart
+    # assert torch.min(edge_vec_0_distance) < 0.0001
+    mask = edge_vec_0_distance < ts
+    if len(edge_vec_0_distance) > 0 and torch.min(edge_vec_0_distance) < ts:
+        logger.error(f"Error edge_vec_0_distance: {torch.min(edge_vec_0_distance)} - > reset to 1")
+        edge_vec_0_distance = torch.where(
+            edge_vec_0_distance < ts,
+            1,
+            edge_vec_0_distance
+        )
+    #     mask = 
+    # else:
+    #     # are we standing at the north pole
+    #     mask = xyz[:, 1].abs().isclose(xyz.new_ones(1))
+
+    # make unit vectors
+    xyz = edge_vec_0 / (edge_vec_0_distance.view(-1, 1))
+    mask = mask + xyz[:, 1].abs().isclose(xyz.new_ones(1))
+
+    # compute alpha and beta
+
+    # latitude (beta)
+    beta = xyz.new_zeros(xyz.shape[0])
+    beta[~mask] = torch.acos(xyz[~mask, 1])
+    beta[mask] = torch.acos(xyz[mask, 1]).detach()
+
+    # longitude (alpha)
+    alpha = torch.zeros_like(beta)
+    alpha[~mask] = torch.atan2(xyz[~mask, 0], xyz[~mask, 2])
+    alpha[mask] = torch.atan2(xyz[mask, 0], xyz[mask, 2]).detach()
+    if training:
+        # random gamma (roll)
+        gamma = torch.rand_like(alpha) * 2 * torch.pi
+        # gamma = torch.zeros_like(alpha)
+    else:
+        gamma = torch.zeros_like(alpha) #* 2 * torch.pi
+
+    # intrinsic to extrinsic swap
+    return -gamma, -beta, -alpha
+
+# # follow fairchem 2.4.0 and e3nn 0.4.0
+# # quick fix: for some special case e.g. [0,0,0],[0,1,0],[0,x,0]
+# def init_edge_rot_euler_angles(edge_distance_vec,ts = 0.000001):
+#     edge_vec_0 = edge_distance_vec
+#     edge_vec_0_distance = torch.norm(edge_vec_0,dim = 1) #torch.sqrt(torch.sum(edge_vec_0**2, dim=1))
+
+#     # Handle small distances using torch.where to maintain graph integrity
+#     # Instead of boolean indexing, we conditionally replace values
+#     edge_vec_0_distance = torch.where(
+#         edge_vec_0_distance < ts,
+#         torch.ones_like(edge_vec_0_distance), # Avoid division by zero
+#         edge_vec_0_distance
+#     )
+    
+#     # Calculate mask logic fully (without boolean indexing for flow control)
+#     # Original mask logic combined with pole check
+#     xyz = edge_vec_0 / (edge_vec_0_distance.view(-1, 1))
+    
+#     # Combine distance check and pole check
+#     orig_dist_mask = torch.norm(edge_distance_vec, dim=1) < ts 
+#     pole_mask = xyz[:, 1].abs().isclose(xyz.new_ones(1))
+#     mask = orig_dist_mask | pole_mask
+
+#     safe_y = torch.clamp(xyz[:, 1], -1-1, 1+1)
+#     beta_full = torch.acos(safe_y)
+#     beta = torch.where(mask, beta_full.detach(), beta_full)
+#     alpha_full = torch.atan2(xyz[:, 0], xyz[:, 2])
+#     alpha = torch.where(mask, alpha_full.detach(), alpha_full)
+
+#     # random gamma (roll)
+#     gamma = torch.rand_like(alpha) * 2 * torch.pi
+
+#     # intrinsic to extrinsic swap
+#     return -gamma, -beta, -alpha
+
+
+# Borrowed from e3nn @ 0.4.0:
+# https://github.com/e3nn/e3nn/blob/0.4.0/e3nn/o3/_wigner.py#L37
+# In 0.5.0, e3nn shifted to torch.matrix_exp which is significantly slower:
+# https://github.com/e3nn/e3nn/blob/0.5.0/e3nn/o3/_wigner.py#L92
+def wigner_D(
+    lv: int,
+    alpha: torch.Tensor,
+    beta: torch.Tensor,
+    gamma: torch.Tensor,
+    _Jd: list[torch.Tensor],
+):
+    alpha, beta, gamma = torch.broadcast_tensors(alpha, beta, gamma)
+    J = _Jd[lv]
+    Xa = _z_rot_mat(alpha, lv)
+    Xb = _z_rot_mat(beta, lv)
+    Xc = _z_rot_mat(gamma, lv)
+    return Xa @ J @ Xb @ J @ Xc
+
+
+def _z_rot_mat(angle: torch.Tensor, lv: int):
+    M = angle.new_zeros((*angle.shape, 2 * lv + 1, 2 * lv + 1))
+
+    # The following code needs to replaced for a for loop because
+    # torch.export barfs on outer product like operations
+    # ie: torch.outer(frequences, angle) (same as frequencies * angle[..., None])
+    # will place a non-sense Guard on the dimensions of angle when attempting to export setting
+    # angle (edge dimensions) as dynamic. This may be fixed in torch2.4.
+
+    # inds = torch.arange(0, 2 * lv + 1, 1, device=device)
+    # reversed_inds = torch.arange(2 * lv, -1, -1, device=device)
+    # frequencies = torch.arange(lv, -lv - 1, -1, dtype=dtype, device=device)
+    # M[..., inds, reversed_inds] = torch.sin(frequencies * angle[..., None])
+    # M[..., inds, inds] = torch.cos(frequencies * angle[..., None])
+
+    inds = list(range(0, 2 * lv + 1, 1))
+    reversed_inds = list(range(2 * lv, -1, -1))
+    frequencies = list(range(lv, -lv - 1, -1))
+    for i in range(len(frequencies)):
+        M[..., inds[i], reversed_inds[i]] = torch.sin(frequencies[i] * angle)
+        M[..., inds[i], inds[i]] = torch.cos(frequencies[i] * angle)
+    return M
+
+
+def eulers_to_wigner(
+    eulers: torch.Tensor,
+    start_lmax: int,
+    end_lmax: int,
+    Jd: list[torch.Tensor],
+    l3_sequential = None
+):
+    """
+    set <rot_clip=True> to handle gradient instability when using gradient-based force/stress prediction.
+    """
+    alpha, beta, gamma = eulers
+
+    size = int((end_lmax + 1) ** 2) - int((start_lmax) ** 2)
+    wigner = torch.zeros(len(alpha), size, size, device=alpha.device, dtype=alpha.dtype)
+    start = 0
+    for lmax in range(start_lmax, end_lmax + 1):
+        block = wigner_D(lmax, alpha, beta, gamma, Jd)
+        end = start + block.size()[1]
+        wigner[:, start:end, start:end] = block
+        start = end
+    
+    if l3_sequential is not None:
+        s = sum([(2*tmp_l3+1)*tmp_l3_cnt for tmp_l3,tmp_l3_cnt in l3_sequential])
+        start = 0
+        wigner_inv = torch.zeros(len(alpha), s, s, device=alpha.device, dtype=alpha.dtype)
+        for idx,(tmp_l3,tmp_l3_cnt) in enumerate(l3_sequential):
+            block = wigner_D(tmp_l3, alpha, beta, gamma, Jd)
+            for _ in range(tmp_l3_cnt):
+                wigner_inv[:, start:start+tmp_l3*2+1, start:start+tmp_l3*2+1] = block
+                start += tmp_l3*2+1
+    else:
+        wigner_inv = wigner
+    return wigner,torch.transpose(wigner_inv, 1, 2).contiguous()
+
+
+class SO3_Embedding:
+    """
+    Helper functions for performing operations on irreps embedding
+
+    Args:
+        length (int):           Batch size
+        lmax_list (list:int):   List of maximum degree of the spherical harmonics
+        num_channels (int):     Number of channels
+        device:                 Device of the output
+        dtype:                  type of the output tensors
+    """
+
+    def __init__(
+        self,
+        length,
+        lmax_list,
+        num_channels,
+        device,
+        dtype,
+    ):
+        super().__init__()
+        self.num_channels = num_channels
+        self.device = device
+        self.dtype = dtype
+        self.num_resolutions = len(lmax_list)
+
+        self.num_coefficients = 0
+        for i in range(self.num_resolutions):
+            self.num_coefficients = self.num_coefficients + int((lmax_list[i] + 1) ** 2)
+
+        embedding = torch.zeros(
+            length,
+            self.num_coefficients,
+            self.num_channels,
+            device=self.device,
+            dtype=self.dtype,
+        )
+
+        self.set_embedding(embedding)
+        self.set_lmax_mmax(lmax_list, lmax_list.copy())
+
+    # Clone an embedding of irreps
+    def clone(self):
+        clone = SO3_Embedding(
+            0,
+            self.lmax_list.copy(),
+            self.num_channels,
+            self.device,
+            self.dtype,
+        )
+        clone.set_embedding(self.embedding.clone())
+        return clone
+
+    # Initialize an embedding of irreps
+    def set_embedding(self, embedding):
+        self.length = len(embedding)
+        self.embedding = embedding
+
+    # Set the maximum order to be the maximum degree
+    def set_lmax_mmax(self, lmax_list, mmax_list):
+        self.lmax_list = lmax_list
+        self.mmax_list = mmax_list
+
+    # Expand the node embeddings to the number of edges
+    def _expand_edge(self, edge_index):
+        embedding = self.embedding[edge_index]
+        self.set_embedding(embedding)
+
+    # Initialize an embedding of irreps of a neighborhood
+    def expand_edge(self, edge_index):
+        x_expand = SO3_Embedding(
+            0,
+            self.lmax_list.copy(),
+            self.num_channels,
+            self.device,
+            self.dtype,
+        )
+        x_expand.set_embedding(self.embedding[edge_index])
+        return x_expand
+
+    # Compute the sum of the embeddings of the neighborhood
+    def _reduce_edge(self, edge_index, num_nodes):
+        new_embedding = torch.zeros(
+            num_nodes,
+            self.num_coefficients,
+            self.num_channels,
+            device=self.embedding.device,
+            dtype=self.embedding.dtype,
+        )
+        new_embedding.index_add_(0, edge_index, self.embedding)
+        self.set_embedding(new_embedding)
+
+    # Reshape the embedding l -> m
+    def _m_primary(self, mapping):
+        self.embedding = torch.einsum("nac, ba -> nbc", self.embedding, mapping.to_m)
+
+    # Reshape the embedding m -> l
+    def _l_primary(self, mapping):
+        # print(self.embedding.dtype,self.dtype)
+        self.embedding = torch.einsum("nac, ab -> nbc", self.embedding, mapping.to_m)
+
+    # Rotate the embedding
+    def _rotate(self, SO3_rotation, lmax_list, mmax_list):
+        if self.num_resolutions == 1:
+            embedding_rotate = SO3_rotation[0].rotate(
+                self.embedding, lmax_list[0], mmax_list[0]
+            )
+        else:
+            offset = 0
+            embedding_rotate = torch.tensor([], device=self.device, dtype=self.dtype)
+            for i in range(self.num_resolutions):
+                num_coefficients = int((self.lmax_list[i] + 1) ** 2)
+                embedding_i = self.embedding[:, offset : offset + num_coefficients]
+                embedding_rotate = torch.cat(
+                    [
+                        embedding_rotate,
+                        SO3_rotation[i].rotate(embedding_i, lmax_list[i], mmax_list[i]),
+                    ],
+                    dim=1,
+                )
+                offset = offset + num_coefficients
+
+        self.embedding = embedding_rotate
+        self.set_lmax_mmax(lmax_list.copy(), mmax_list.copy())
+
+    # Rotate the embedding by the inverse of the rotation matrix
+    def _rotate_inv(self, SO3_rotation, mappingReduced):
+        if self.num_resolutions == 1:
+            embedding_rotate = SO3_rotation[0].rotate_inv(
+                self.embedding, self.lmax_list[0], self.mmax_list[0]
+            )
+        else:
+            offset = 0
+            embedding_rotate = torch.tensor([], device=self.device, dtype=self.dtype)
+            for i in range(self.num_resolutions):
+                num_coefficients = mappingReduced.res_size[i]
+                embedding_i = self.embedding[:, offset : offset + num_coefficients]
+                embedding_rotate = torch.cat(
+                    [
+                        embedding_rotate,
+                        SO3_rotation[i].rotate_inv(
+                            embedding_i, self.lmax_list[i], self.mmax_list[i]
+                        ),
+                    ],
+                    dim=1,
+                )
+                offset = offset + num_coefficients
+        self.embedding = embedding_rotate
+
+        # Assume mmax = lmax when rotating back
+        for i in range(self.num_resolutions):
+            self.mmax_list[i] = int(self.lmax_list[i])
+        self.set_lmax_mmax(self.lmax_list, self.mmax_list)
+
+    # Compute point-wise spherical non-linearity
+    def _grid_act(self, SO3_grid, act, mappingReduced):
+        offset = 0
+        for i in range(self.num_resolutions):
+            num_coefficients = mappingReduced.res_size[i]
+
+            if self.num_resolutions == 1:
+                x_res = self.embedding
+            else:
+                x_res = self.embedding[
+                    :, offset : offset + num_coefficients
+                ].contiguous()
+            to_grid_mat = SO3_grid[self.lmax_list[i]][
+                self.mmax_list[i]
+            ].get_to_grid_mat(self.device)
+            from_grid_mat = SO3_grid[self.lmax_list[i]][
+                self.mmax_list[i]
+            ].get_from_grid_mat(self.device)
+
+            x_grid = torch.einsum("bai, zic -> zbac", to_grid_mat, x_res)
+            x_grid = act(x_grid)
+            x_res = torch.einsum("bai, zbac -> zic", from_grid_mat, x_grid)
+            if self.num_resolutions == 1:
+                self.embedding = x_res
+            else:
+                self.embedding[:, offset : offset + num_coefficients] = x_res
+            offset = offset + num_coefficients
+
+    # Compute a sample of the grid
+    def to_grid(self, SO3_grid, lmax=-1):
+        if lmax == -1:
+            lmax = max(self.lmax_list)
+
+        to_grid_mat_lmax = SO3_grid[lmax][lmax].get_to_grid_mat(self.device)
+        grid_mapping = SO3_grid[lmax][lmax].mapping
+
+        offset = 0
+        x_grid = torch.tensor([], device=self.device)
+
+        for i in range(self.num_resolutions):
+            num_coefficients = int((self.lmax_list[i] + 1) ** 2)
+            if self.num_resolutions == 1:
+                x_res = self.embedding
+            else:
+                x_res = self.embedding[
+                    :, offset : offset + num_coefficients
+                ].contiguous()
+            to_grid_mat = to_grid_mat_lmax[
+                :, :, grid_mapping.coefficient_idx(self.lmax_list[i], self.lmax_list[i])
+            ]
+            x_grid = torch.cat(
+                [x_grid, torch.einsum("bai, zic -> zbac", to_grid_mat, x_res)], dim=3
+            )
+            offset = offset + num_coefficients
+
+        return x_grid
+
+    # Compute irreps from grid representation
+    def _from_grid(self, x_grid, SO3_grid, lmax=-1):
+        if lmax == -1:
+            lmax = max(self.lmax_list)
+
+        from_grid_mat_lmax = SO3_grid[lmax][lmax].get_from_grid_mat(self.device)
+        grid_mapping = SO3_grid[lmax][lmax].mapping
+
+        offset = 0
+        offset_channel = 0
+        for i in range(self.num_resolutions):
+            from_grid_mat = from_grid_mat_lmax[
+                :, :, grid_mapping.coefficient_idx(self.lmax_list[i], self.lmax_list[i])
+            ]
+            if self.num_resolutions == 1:
+                temp = x_grid
+            else:
+                temp = x_grid[
+                    :, :, :, offset_channel : offset_channel + self.num_channels
+                ]
+            x_res = torch.einsum("bai, zbac -> zic", from_grid_mat, temp)
+            num_coefficients = int((self.lmax_list[i] + 1) ** 2)
+
+            if self.num_resolutions == 1:
+                self.embedding = x_res
+            else:
+                self.embedding[:, offset : offset + num_coefficients] = x_res
+
+            offset = offset + num_coefficients
+            offset_channel = offset_channel + self.num_channels
+
+    def to_e3nn_embeddings(self):
+        from e3nn.io import SphericalTensor
+        from e3nn.o3 import Irreps
+
+        embedding = self.embedding.reshape(self.length, -1)
+
+        l = o3.Irreps(
+            str(SphericalTensor(self.lmax_list[-1], 1, -1)).replace(
+                "1x", f"{self.num_channels}x"
+            )
+        )
+        # multiple channels
+        return l, embedding
+
+
+class CoefficientMappingModule(torch.nn.Module):
+    """
+    Helper module for coefficients used to reshape l <--> m and to get coefficients of specific degree or order
+
+    Args:
+        lmax_list (list:int):   List of maximum degree of the spherical harmonics
+        mmax_list (list:int):   List of maximum order of the spherical harmonics
+    """
+
+    def __init__(
+        self,
+        lmax_list,
+        mmax_list,
+    ):
+        super().__init__()
+
+        self.lmax_list = lmax_list
+        self.mmax_list = mmax_list
+        self.num_resolutions = len(lmax_list)
+
+        # Temporarily use `cpu` as device and this will be overwritten.
+        self.device = "cpu"
+
+        # Compute the degree (l) and order (m) for each entry of the embedding
+        l_harmonic = torch.tensor([], device=self.device).long()
+        m_harmonic = torch.tensor([], device=self.device).long()
+        m_complex = torch.tensor([], device=self.device).long()
+
+        res_size = torch.zeros([self.num_resolutions], device=self.device).long()
+
+        offset = 0
+        for i in range(self.num_resolutions):
+            for l in range(0, self.lmax_list[i] + 1):
+                mmax = min(self.mmax_list[i], l)
+                m = torch.arange(-mmax, mmax + 1, device=self.device).long()
+                m_complex = torch.cat([m_complex, m], dim=0)
+                m_harmonic = torch.cat([m_harmonic, torch.abs(m).long()], dim=0)
+                l_harmonic = torch.cat([l_harmonic, m.fill_(l).long()], dim=0)
+            res_size[i] = len(l_harmonic) - offset
+            offset = len(l_harmonic)
+
+        num_coefficients = len(l_harmonic)
+        # `self.to_m` moves m components from different L to contiguous index
+        to_m = torch.zeros([num_coefficients, num_coefficients], device=self.device)
+        m_size = torch.zeros([max(self.mmax_list) + 1], device=self.device).long()
+
+        # The following is implemented poorly - very slow. It only gets called
+        # a few times so haven't optimized.
+        offset = 0
+        for m in range(max(self.mmax_list) + 1):
+            idx_r, idx_i = self.complex_idx(m, -1, m_complex, l_harmonic)
+
+            for idx_out, idx_in in enumerate(idx_r):
+                to_m[idx_out + offset, idx_in] = 1.0
+            offset = offset + len(idx_r)
+
+            m_size[m] = int(len(idx_r))
+
+            for idx_out, idx_in in enumerate(idx_i):
+                to_m[idx_out + offset, idx_in] = 1.0
+            offset = offset + len(idx_i)
+
+        to_m = to_m.detach()
+
+        # save tensors and they will be moved to GPU
+        self.register_buffer("l_harmonic", l_harmonic)
+        self.register_buffer("m_harmonic", m_harmonic)
+        self.register_buffer("m_complex", m_complex)
+        self.register_buffer("res_size", res_size)
+        self.register_buffer("to_m", to_m)
+        self.register_buffer("m_size", m_size)
+
+        # for caching the output of `coefficient_idx`
+        self.lmax_cache, self.mmax_cache = None, None
+        self.mask_indices_cache = None
+        self.rotate_inv_rescale_cache = None
+
+    # Return mask containing coefficients of order m (real and imaginary parts)
+    def complex_idx(self, m, lmax, m_complex, l_harmonic):
+        """
+        Add `m_complex` and `l_harmonic` to the input arguments
+        since we cannot use `self.m_complex`.
+        """
+        if lmax == -1:
+            lmax = max(self.lmax_list)
+
+        indices = torch.arange(len(l_harmonic), device=self.device)
+        # Real part
+        mask_r = torch.bitwise_and(l_harmonic.le(lmax), m_complex.eq(m))
+        mask_idx_r = torch.masked_select(indices, mask_r)
+
+        mask_idx_i = torch.tensor([], device=self.device).long()
+        # Imaginary part
+        if m != 0:
+            mask_i = torch.bitwise_and(l_harmonic.le(lmax), m_complex.eq(-m))
+            mask_idx_i = torch.masked_select(indices, mask_i)
+
+        return mask_idx_r, mask_idx_i
+
+    # Return mask containing coefficients less than or equal to degree (l) and order (m)
+    def coefficient_idx(self, lmax, mmax):
+        if (self.lmax_cache is not None) and (self.mmax_cache is not None):
+            if (self.lmax_cache == lmax) and (self.mmax_cache == mmax):
+                if self.mask_indices_cache is not None:
+                    return self.mask_indices_cache
+
+        mask = torch.bitwise_and(self.l_harmonic.le(lmax), self.m_harmonic.le(mmax))
+        self.device = mask.device
+        indices = torch.arange(len(mask), device=self.device)
+        mask_indices = torch.masked_select(indices, mask)
+        self.lmax_cache, self.mmax_cache = lmax, mmax
+        self.mask_indices_cache = mask_indices
+        return self.mask_indices_cache
+
+    # Return the re-scaling for rotating back to original frame
+    # this is required since we only use a subset of m components for SO(2) convolution
+    def get_rotate_inv_rescale(self, lmax, mmax):
+        if (self.lmax_cache is not None) and (self.mmax_cache is not None):
+            if (self.lmax_cache == lmax) and (self.mmax_cache == mmax):
+                if self.rotate_inv_rescale_cache is not None:
+                    return self.rotate_inv_rescale_cache
+
+        if self.mask_indices_cache is None:
+            self.coefficient_idx(lmax, mmax)
+
+        rotate_inv_rescale = torch.ones(
+            (1, (lmax + 1) ** 2, (lmax + 1) ** 2), device=self.device
+        )
+        for l in range(lmax + 1):
+            if l <= mmax:
+                continue
+            start_idx = l**2
+            length = 2 * l + 1
+            rescale_factor = math.sqrt(length / (2 * mmax + 1))
+            rotate_inv_rescale[
+                :, start_idx : (start_idx + length), start_idx : (start_idx + length)
+            ] = rescale_factor
+        rotate_inv_rescale = rotate_inv_rescale[:, :, self.mask_indices_cache]
+        self.rotate_inv_rescale_cache = rotate_inv_rescale
+        return self.rotate_inv_rescale_cache
+
+    def __repr__(self):
+        return f"{self.__class__.__name__}(lmax_list={self.lmax_list}, mmax_list={self.mmax_list})"
+
+
 
 
 class SO3_Grid(torch.nn.Module):
@@ -159,7 +874,6 @@ class CellExpander:
         cutoff=10.0,
         expanded_token_cutoff=512,
         pbc_expanded_num_cell_per_direction=10,
-        pbc_multigraph_cutoff=10.0,
     ):
         self.cells = []
         for i in range(
@@ -204,7 +918,6 @@ class CellExpander:
 
         self.expanded_token_cutoff = expanded_token_cutoff
 
-        self.pbc_multigraph_cutoff = pbc_multigraph_cutoff
 
         self.pbc_expanded_num_cell_per_direction = pbc_expanded_num_cell_per_direction
 
@@ -235,24 +948,9 @@ class CellExpander:
         )  # num_expand_cell x 26
         self.conflict_to_consider_mask = conflict_to_consider_mask
 
-    def polynomial(self, dist: torch.Tensor, cutoff: float) -> torch.Tensor:
-        """
-        Polynomial cutoff function,ref: https://arxiv.org/abs/2204.13639
-        Args:
-            dist (tf.Tensor): distance tensor
-            cutoff (float): cutoff distance
-        Returns: polynomial cutoff functions
-        """
-        ratio = torch.div(dist, cutoff)
-        result = (
-            1
-            - 6 * torch.pow(ratio, 5)
-            + 15 * torch.pow(ratio, 4)
-            - 10 * torch.pow(ratio, 3)
-        )
-        return torch.clamp(result, min=0.0)
+    
 
-    def _get_cell_tensors(self, cell, use_local_attention):
+    def _get_cell_tensors(self, cell, use_local_attention=None):
         # fitler impossible offsets according to cell size and cutoff
         def _get_max_offset_for_dim(cell, dim):
             lattice_vec_0 = cell[:, dim, :]
@@ -263,12 +961,11 @@ class CellExpander:
                 lattice_vec_1_2[:, 0, :], lattice_vec_1_2[:, 1, :], dim=-1
             )
             normal_vec = normal_vec / normal_vec.norm(dim=-1, keepdim=True)
-            cutoff = self.pbc_multigraph_cutoff if use_local_attention else self.cutoff
 
             max_offset = int(
                 torch.max(
                     torch.ceil(
-                        cutoff
+                        self.cutoff
                         / torch.abs(torch.sum(normal_vec * lattice_vec_0, dim=-1))
                     )
                 )
@@ -364,240 +1061,33 @@ class CellExpander:
             conflict_mask.any()
         ), f"{all_dist[conflict_mask]} {all_atoms[conflict_mask.any(dim=-2)]}"
 
-    def expand(
-        self,
-        pos,
-        init_pos,
-        pbc,
-        num_atoms,
-        atoms,
-        cell,
-        pair_token_type,
-        use_local_attention=True,
-        use_grad=False,
-    ):
-        with torch.set_grad_enabled(use_grad):
-            pos = pos.float()
-            cell = cell.float()
-            batch_size, max_num_atoms = pos.size()[:2]
-            cell_tensor, cell_mask, selected_cell_mask = self._get_cell_tensors(
-                cell, use_local_attention
-            )
-
-            if not use_local_attention:
-                all_conflict_mask = self._get_conflict_mask(cell, pos, atoms)
-                all_conflict_mask = all_conflict_mask[:, selected_cell_mask, :].reshape(
-                    batch_size, -1
-                )
-            # if expand_includeself:
-            #     cell_tensor = torch.cat([torch.zeros((1,3),device = cell_tensor.device),cell_tensor],dim = 0)
-            #     cell_mask = torch.cat([torch.ones((1,3),device = cell_mask.device).bool(),cell_mask],dim = 0)
-
-            cell_tensor = (
-                cell_tensor.unsqueeze(0).repeat(batch_size, 1, 1).to(dtype=cell.dtype)
-            )
-            num_expanded_cell = cell_tensor.size()[1]
-            offset = torch.bmm(cell_tensor, cell)  # B x num_expand_cell x 3
-            expand_pos = pos.unsqueeze(1) + offset.unsqueeze(
-                2
-            )  # B x num_expand_cell x T x 3
-            expand_pos = expand_pos.view(
-                batch_size, -1, 3
-            )  # B x (num_expand_cell x T) x 3
-
-            # eliminate duplicate atoms of expanded atoms, comparing with the original unit cell
-            expand_dist = torch.norm(
-                pos.unsqueeze(2) - expand_pos.unsqueeze(1), p=2, dim=-1
-            )  # B x T x (num_expand_cell x T)
-            expand_atoms = atoms.repeat(1, num_expanded_cell)
-            expand_atom_identical = atoms.unsqueeze(-1) == expand_atoms.unsqueeze(1)
-            expand_mask = (
-                expand_dist
-                < (self.pbc_multigraph_cutoff if use_local_attention else self.cutoff)
-            ) & (
-                (expand_dist > 1e-5) | ~expand_atom_identical
-            )  # B x T x (num_expand_cell x T)
-            expand_mask = torch.masked_fill(
-                expand_mask, atoms.eq(0).unsqueeze(-1), False
-            )
-            expand_mask = torch.sum(expand_mask, dim=1) > 0
-            if not use_local_attention:
-                expand_mask = expand_mask & (~all_conflict_mask)
-            expand_mask = expand_mask & (
-                ~(atoms.eq(0).repeat(1, num_expanded_cell))
-            )  # B x (num_expand_cell x T)
-
-            cell_mask = (
-                torch.all(pbc.unsqueeze(1) >= cell_mask.unsqueeze(0), dim=-1)
-                .unsqueeze(-1)
-                .repeat(1, 1, max_num_atoms)
-                .reshape(expand_mask.size())
-            )  # B x (num_expand_cell x T)
-            expand_mask &= cell_mask
-            expand_len = torch.sum(expand_mask, dim=-1)
-
-            threshold_num_expanded_token = torch.clamp(
-                self.expanded_token_cutoff - num_atoms, min=0
-            )
-
-            max_expand_len = torch.max(expand_len)
-
-            # cutoff within expanded_token_cutoff tokens
-            need_threshold = expand_len > threshold_num_expanded_token
-            if need_threshold.any():
-                min_expand_dist = expand_dist.masked_fill(expand_dist <= 1e-5, np.inf)
-                expand_dist_mask = (
-                    atoms.eq(0).unsqueeze(-1) | atoms.eq(0).unsqueeze(1)
-                ).repeat(1, 1, num_expanded_cell)
-                min_expand_dist = min_expand_dist.masked_fill_(expand_dist_mask, np.inf)
-                min_expand_dist = min_expand_dist.masked_fill_(
-                    ~cell_mask.unsqueeze(1), np.inf
-                )
-                min_expand_dist = torch.min(min_expand_dist, dim=1)[0]
-
-                need_threshold_distances = min_expand_dist[
-                    need_threshold
-                ]  # B x (num_expand_cell x T)
-                threshold_num_expanded_token = threshold_num_expanded_token[
-                    need_threshold
-                ]
-                threshold_dist = torch.sort(
-                    need_threshold_distances, dim=-1, descending=False
-                )[0]
-
-                threshold_dist = torch.gather(
-                    threshold_dist, 1, threshold_num_expanded_token.unsqueeze(-1)
-                )
-
-                new_expand_mask = min_expand_dist[need_threshold] < threshold_dist
-                expand_mask[need_threshold] &= new_expand_mask
-                expand_len = torch.sum(expand_mask, dim=-1)
-                max_expand_len = torch.max(expand_len)
-
-            outcell_index = torch.zeros(
-                [batch_size, max_expand_len], dtype=torch.long, device=pos.device
-            )
-            expand_pos_compressed = torch.zeros(
-                [batch_size, max_expand_len, 3], dtype=pos.dtype, device=pos.device
-            )
-            outcell_all_index = torch.arange(
-                max_num_atoms, dtype=torch.long, device=pos.device
-            ).repeat(num_expanded_cell)
-            for i in range(batch_size):
-                outcell_index[i, : expand_len[i]] = outcell_all_index[expand_mask[i]]
-                # assert torch.all(outcell_index[i, :expand_len[i]] < natoms[i])
-                expand_pos_compressed[i, : expand_len[i], :] = expand_pos[
-                    i, expand_mask[i], :
-                ]
-
-            expand_pair_token_type = torch.gather(
-                pair_token_type,
-                dim=2,
-                index=outcell_index.unsqueeze(1)
-                .unsqueeze(-1)
-                .repeat(1, max_num_atoms, 1, pair_token_type.size()[-1]),
-            )
-            expand_node_type_edge = torch.cat(
-                [pair_token_type, expand_pair_token_type], dim=2
-            )
-
-            if use_local_attention:
-                dist = (pos.unsqueeze(2) - pos.unsqueeze(1)).norm(p=2, dim=-1)
-                expand_dist_compress = (
-                    pos.unsqueeze(2) - expand_pos_compressed.unsqueeze(1)
-                ).norm(p=2, dim=-1)
-                local_attention_weight = self.polynomial(
-                    torch.cat([dist, expand_dist_compress], dim=2),
-                    cutoff=self.pbc_multigraph_cutoff,
-                )
-                is_periodic = pbc.any(dim=-1)
-                local_attention_weight = local_attention_weight.masked_fill(
-                    ~is_periodic.unsqueeze(-1).unsqueeze(-1), 1.0
-                )
-                local_attention_weight = local_attention_weight.masked_fill(
-                    atoms.eq(0).unsqueeze(-1), 1.0
-                )
-                expand_mask = mask_after_k_persample(
-                    batch_size, max_expand_len, expand_len
-                )
-                full_mask = torch.cat([atoms.eq(0), expand_mask], dim=-1)
-                local_attention_weight = local_attention_weight.masked_fill(
-                    atoms.eq(0).unsqueeze(-1), 1.0
-                )
-                local_attention_weight = local_attention_weight.masked_fill(
-                    full_mask.unsqueeze(1), 0.0
-                )
-                pbc_expand_batched = {
-                    "expand_pos": expand_pos_compressed,
-                    "outcell_index": outcell_index,
-                    "expand_mask": expand_mask,
-                    "local_attention_weight": local_attention_weight,
-                    "expand_node_type_edge": expand_node_type_edge,
-                }
-            else:
-                pbc_expand_batched = {
-                    "expand_pos": expand_pos_compressed,
-                    "outcell_index": outcell_index,
-                    "expand_mask": mask_after_k_persample(
-                        batch_size, max_expand_len, expand_len
-                    ),
-                    "local_attention_weight": None,
-                    "expand_node_type_edge": expand_node_type_edge,
-                }
-
-            expand_pos_no_offset = torch.gather(
-                pos, dim=1, index=outcell_index.unsqueeze(-1)
-            )
-            offset = expand_pos_compressed - expand_pos_no_offset
-            init_expand_pos_no_offset = torch.gather(
-                init_pos, dim=1, index=outcell_index.unsqueeze(-1)
-            )
-            init_expand_pos = init_expand_pos_no_offset + offset
-            init_expand_pos = init_expand_pos.masked_fill(
-                pbc_expand_batched["expand_mask"].unsqueeze(-1),
-                0.0,
-            )
-
-            pbc_expand_batched["init_expand_pos"] = init_expand_pos
-
-            # # self.check_conflict(pos, atoms, pbc_expand_batched)
-            # print(f"local attention weight {local_attention_weight.numel()} zero:{torch.sum(local_attention_weight==0)}")
-            # # print(torch.sum(local_attention_weight==0,dim = 1)==(local_attention_weight.shape[1]))
-            # print("N1+N2, ",local_attention_weight.shape[2],torch.sum(
-            #     torch.sum(local_attention_weight==0,dim = 1)==local_attention_weight.shape[1])/(local_attention_weight.shape[0]*1.0))
-
-            return pbc_expand_batched
 
     def expand_includeself(
         self,
         pos,
-        init_pos,
         pbc,
-        num_atoms,
-        atoms,
+        # num_atoms,
+        atomic_numbers,
         cell,
         neighbors_radius,
-        pair_token_type=None,
-        use_local_attention=True,
+        # use_local_attention=True,
         use_grad=False,
         padding_mask=None,
     ):
         with torch.set_grad_enabled(use_grad):
-            pos = torch.where(
-                padding_mask.unsqueeze(dim=-1).repeat(1, 1, 3), 999.0, pos.float()
-            )
             # pos = pos.float()
             cell = cell.float()
             batch_size, max_num_atoms = pos.size()[:2]
-            cell_tensor, cell_mask, selected_cell_mask = self._get_cell_tensors(
-                cell, use_local_attention
+            if padding_mask is None:
+                padding_mask = torch.zeros((batch_size,max_num_atoms)).bool()
+            pos = torch.where(
+                padding_mask.unsqueeze(dim=-1).repeat(1, 1, 3), 999.0, pos.float()
             )
 
-            # if not use_local_attention:
-            #     all_conflict_mask = self._get_conflict_mask(cell, pos, atoms)
-            #     all_conflict_mask = all_conflict_mask[:, selected_cell_mask, :].reshape(
-            #         batch_size, -1
-            #     )
+            cell_tensor, cell_mask, _ = self._get_cell_tensors(
+                cell,
+            )
+
             cell_tensor = torch.cat(
                 [torch.zeros((1, 3), device=cell_tensor.device), cell_tensor], dim=0
             )
@@ -642,14 +1132,14 @@ class CellExpander:
             expand_mask = (
                 expand_mask
                 & (~padding_mask.repeat(1, num_expanded_cell).unsqueeze(1))
-                & (~(atoms.eq(0).unsqueeze(-1)))
+                & (~(atomic_numbers.eq(0).unsqueeze(-1)))
             )
 
             expand_mask = torch.sum(expand_mask, dim=1) > 0
             # if not use_local_attention:
             #     expand_mask = expand_mask & (~all_conflict_mask)
             expand_mask = expand_mask & (
-                ~(atoms.eq(0).repeat(1, num_expanded_cell))
+                ~(atomic_numbers.eq(0).repeat(1, num_expanded_cell))
             )  # B x (num_expand_cell x T)
 
             cell_mask = (
@@ -661,43 +1151,44 @@ class CellExpander:
             expand_mask &= cell_mask
             expand_len = torch.sum(expand_mask, dim=-1)
 
-            threshold_num_expanded_token = torch.clamp(
-                self.expanded_token_cutoff - num_atoms * 0, min=0
-            )
+            # threshold_num_expanded_token = torch.zeros(batch_size,device=cell_tensor.device).int()+self.expanded_token_cutoff
+            # torch.clamp(
+            #     self.expanded_token_cutoff - num_atoms*0, min=0
+            # )
 
             max_expand_len = torch.max(expand_len)
 
-            # cutoff within expanded_token_cutoff tokens
-            need_threshold = expand_len > threshold_num_expanded_token
-            if need_threshold.any():
-                min_expand_dist = expand_dist.masked_fill(expand_dist <= 1e-5, np.inf)
-                expand_dist_mask = (
-                    atoms.eq(0).unsqueeze(-1) | atoms.eq(0).unsqueeze(1)
-                ).repeat(1, 1, num_expanded_cell)
-                min_expand_dist = min_expand_dist.masked_fill_(expand_dist_mask, np.inf)
-                min_expand_dist = min_expand_dist.masked_fill_(
-                    ~cell_mask.unsqueeze(1), np.inf
-                )
-                min_expand_dist = torch.min(min_expand_dist, dim=1)[0]
+            # # cutoff within expanded_token_cutoff tokens
+            # need_threshold = expand_len > threshold_num_expanded_token
+            # if need_threshold.any():
+            #     min_expand_dist = expand_dist.masked_fill(expand_dist <= 1e-5, np.inf)
+            #     expand_dist_mask = (
+            #         atomic_numbers.eq(0).unsqueeze(-1) | atomic_numbers.eq(0).unsqueeze(1)
+            #     ).repeat(1, 1, num_expanded_cell)
+            #     min_expand_dist = min_expand_dist.masked_fill_(expand_dist_mask, np.inf)
+            #     min_expand_dist = min_expand_dist.masked_fill_(
+            #         ~cell_mask.unsqueeze(1), np.inf
+            #     )
+            #     min_expand_dist = torch.min(min_expand_dist, dim=1)[0]
 
-                need_threshold_distances = min_expand_dist[
-                    need_threshold
-                ]  # B x (num_expand_cell x T)
-                threshold_num_expanded_token = threshold_num_expanded_token[
-                    need_threshold
-                ]
-                threshold_dist = torch.sort(
-                    need_threshold_distances, dim=-1, descending=False
-                )[0]
+            #     need_threshold_distances = min_expand_dist[
+            #         need_threshold
+            #     ]  # B x (num_expand_cell x T)
+            #     threshold_num_expanded_token = threshold_num_expanded_token[
+            #         need_threshold
+            #     ]
+            #     threshold_dist = torch.sort(
+            #         need_threshold_distances, dim=-1, descending=False
+            #     )[0]
 
-                threshold_dist = torch.gather(
-                    threshold_dist, 1, threshold_num_expanded_token.unsqueeze(-1).long()
-                )
+            #     threshold_dist = torch.gather(
+            #         threshold_dist, 1, threshold_num_expanded_token.unsqueeze(-1).long()
+            #     )
 
-                new_expand_mask = min_expand_dist[need_threshold] < threshold_dist
-                expand_mask[need_threshold] &= new_expand_mask
-                expand_len = torch.sum(expand_mask, dim=-1)
-                max_expand_len = torch.max(expand_len)
+            #     new_expand_mask = min_expand_dist[need_threshold] < threshold_dist
+            #     expand_mask[need_threshold] &= new_expand_mask
+            #     expand_len = torch.sum(expand_mask, dim=-1)
+            #     max_expand_len = torch.max(expand_len)
 
             outcell_index = torch.zeros(
                 [batch_size, max_expand_len], dtype=torch.long, device=pos.device
@@ -714,16 +1205,6 @@ class CellExpander:
                 expand_pos_compressed[i, : expand_len[i], :] = expand_pos[
                     i, expand_mask[i], :
                 ]
-            # expand_pair_token_type = torch.gather(
-            #     pair_token_type,
-            #     dim=2,
-            #     index=outcell_index.unsqueeze(1)
-            #     .unsqueeze(-1)
-            #     .repeat(1, max_num_atoms, 1, pair_token_type.size()[-1]),
-            # )
-            # expand_node_type_edge = torch.cat(
-            #     [pair_token_type, expand_pair_token_type], dim=2
-            # )
 
             # if use_local_attention:
             #     expand_dist_compress = (
@@ -731,7 +1212,7 @@ class CellExpander:
             #     ).norm(p=2, dim=-1)
             #     local_attention_weight = self.polynomial(
             #         expand_dist_compress,
-            #         cutoff=self.pbc_multigraph_cutoff,
+            #         cutoff=self.cutoff,
             #     )
             #     is_periodic = pbc.any(dim=-1)
             #     local_attention_weight = local_attention_weight.masked_fill(
@@ -758,12 +1239,12 @@ class CellExpander:
             #     }
             # else:
             pbc_expand_batched = {
-                "expand_pos": expand_pos_compressed,
+                "expand_node_pos": expand_pos_compressed.float(),
                 "outcell_index": outcell_index,
-                "expand_mask": mask_after_k_persample(
+                "expand_node_mask": logical_not(mask_after_k_persample(
                     batch_size, max_expand_len, expand_len
-                ),
-                "local_attention_weight": None,
+                )),
+                # "local_attention_weight": None,
                 # "expand_node_type_edge": expand_node_type_edge,
             }
             # print(pbc_expand_batched["expand_mask"],
@@ -792,92 +1273,6 @@ class CellExpander:
             # pbc_expand_batched["local_attention_weight"] = None
             return pbc_expand_batched
 
-    # B = 20
-    # N = 15
-    # topK = 20
-    # max_radius = 5.1
-
-    # candidate_cells = [[i, j, k]
-    #             for i in range(-5, 5 + 1)
-    #             for j in range(-5, 5 + 1)
-    #             for k in range(-5, 5 + 1)]
-    # candidate_cells = torch.tensor(candidate_cells)
-    # cell = torch.randn(B,3,3)
-    # node_pos = torch.randn(B,N,3)
-    # padding_mask = torch.randn(B,N)>0
-    # node_mask = ~padding_mask
-    # node_pos[padding_mask] = 9999
-
-
-#     def expand_includeself_clean(
-#     pos,
-#     padding_mask,
-#     is_pbc,
-#     cell,
-#     max_radius,
-#     max_neighbors,
-#     candidate_cells,
-#     use_grad=False
-# ):
-#     with torch.set_grad_enabled(use_grad):
-#         # pos = torch.randn(B,N,3)
-#         pos = pos.float()
-#         cell = cell.float()
-#         B, N = pos.size()[:2]
-#         max_offsets , _ = torch.max(
-#                 torch.ceil(torch.linalg.norm(cell,dim = 2)),dim = 0)
-#         max_offsets = is_pbc[0]*max_offsets
-#         legal_cell = candidate_cells[(candidate_cells.abs()<=max_offsets).all(dim=-1)]
-#         legal_cell = legal_cell.unsqueeze(0).repeat(B, 1, 1).to(dtype=cell.dtype)
-#         num_expanded_cell = legal_cell.shape[1]
-
-
-#         pos[padding_mask] = 9999
-#         offset = torch.bmm(legal_cell, cell)  # B x num_expand_cell x 3
-#         expand_pos = (pos.unsqueeze(1) + offset.unsqueeze(2)).view(B,-1,3)
-
-#         expand_dist = torch.norm(
-#             pos.unsqueeze(2) - expand_pos.unsqueeze(1), p=2, dim=-1
-#         )  # B x T x (num_expand_cell x T)
-
-#         max_neighbors = min(max_neighbors,expand_pos.shape[1])
-#         values, _ = torch.topk(expand_dist, max_neighbors,dim = -1,largest=False)
-
-#         expand_legal_mask = (expand_dist<=(values[:,:,max_neighbors-1].unsqueeze(dim=-1))) & \
-#                         (expand_dist < max_radius)       & \
-#                         (expand_dist > 1e-5)
-
-#         expand_legal_mask = torch.sum(expand_legal_mask, dim=1) > 0
-
-
-#         expand_len = torch.sum(expand_legal_mask, dim=-1)
-#         max_expand_len = torch.max(expand_len)
-#         expand_mask = (torch.arange(0, max_expand_len,device=pos.device)[None].repeat(B,1))>=(expand_len.unsqueeze(dim = -1))
-
-
-#         outcell_index = torch.zeros(
-#             [B, max_expand_len], dtype=torch.long, device=pos.device
-#         )
-#         expand_pos_compressed = torch.zeros(
-#             [B, max_expand_len, 3], dtype=pos.dtype, device=pos.device
-#         )
-#         outcell_all_index = torch.arange(
-#             N, dtype=torch.long, device=pos.device
-#         ).repeat(num_expanded_cell)
-#         for i in range(B):
-#             outcell_index[i, : expand_len[i]] = outcell_all_index[expand_legal_mask[i]]
-#             expand_pos_compressed[i, : expand_len[i], :] = expand_pos[
-#                 i, expand_legal_mask[i], :
-#             ]
-
-#         pbc_expand_batched = {
-#                 "expand_pos": expand_pos_compressed,
-#                 "outcell_index": outcell_index,
-#                 "expand_mask": expand_mask,
-#             }
-#         print(pos.shape,expand_pos_compressed.shape)
-#         return pbc_expand_batched
-
 
 def get_normalization_layer(
     norm_type, lmax, num_channels, eps=1e-5, affine=True, normalization="component"
@@ -889,13 +1284,11 @@ def get_normalization_layer(
         "rms_norm_sh_BL",
         "identity",
     ]
-    if norm_type == "layer_norm":
-        norm_class = EquivariantLayerNormArray
-    elif norm_type == "layer_norm_sh" or norm_type == "layer_norm_sh_BL":
-        norm_class = EquivariantLayerNormArraySphericalHarmonics
-    elif norm_type == "rms_norm_sh" or norm_type == "rms_norm_sh_BL":
-        #     norm_class = EquivariantRMSNormArraySphericalHarmonicsV2
-        # elif norm_type == "rms_norm_sh_BL":
+    # if norm_type == "layer_norm":
+    #     norm_class = EquivariantLayerNormArray
+    # elif norm_type == "layer_norm_sh" or norm_type == "layer_norm_sh_BL":
+    #     norm_class = EquivariantLayerNormArraySphericalHarmonics
+    if norm_type == "rms_norm_sh" or norm_type == "rms_norm_sh_BL":
         norm_class = EquivariantRMSNormArraySphericalHarmonicsV2_BL
     elif norm_type == "identity":
         norm_class = nn.Identity
@@ -937,7 +1330,6 @@ class EquivariantLayerNormArray(nn.Module):
     def __repr__(self):
         return f"{self.__class__.__name__}(lmax={self.lmax}, num_channels={self.num_channels}, eps={self.eps})"
 
-    @torch.cuda.amp.autocast(enabled=False)
     def forward(self, node_input):
         """
         Assume input is of shape [N, sphere_basis, C]
@@ -1039,7 +1431,6 @@ class EquivariantLayerNormArraySphericalHarmonics(nn.Module):
     def __repr__(self):
         return f"{self.__class__.__name__}(lmax={self.lmax}, num_channels={self.num_channels}, eps={self.eps}, std_balance_degrees={self.std_balance_degrees})"
 
-    @torch.cuda.amp.autocast(enabled=False)
     def forward(self, node_input):
         """
         Assume input is of shape [N, sphere_basis, C]
@@ -1125,7 +1516,6 @@ class EquivariantRMSNormArraySphericalHarmonics(nn.Module):
     def __repr__(self):
         return f"{self.__class__.__name__}(lmax={self.lmax}, num_channels={self.num_channels}, eps={self.eps})"
 
-    @torch.cuda.amp.autocast(enabled=False)
     def forward(self, node_input):
         """
         Assume input is of shape [N, sphere_basis, C]
@@ -1220,7 +1610,6 @@ class EquivariantRMSNormArraySphericalHarmonicsV2(nn.Module):
     def __repr__(self):
         return f"{self.__class__.__name__}(lmax={self.lmax}, num_channels={self.num_channels}, eps={self.eps}, centering={self.centering}, std_balance_degrees={self.std_balance_degrees})"
 
-    @torch.cuda.amp.autocast(enabled=False)
     def forward(self, node_input, batch=None):
         """
         Assume input is of shape [N, sphere_basis, C]
@@ -1331,7 +1720,6 @@ class EquivariantRMSNormArraySphericalHarmonicsV2_BL(nn.Module):
     def __repr__(self):
         return f"{self.__class__.__name__}(lmax={self.lmax}, num_channels={self.num_channels}, eps={self.eps}, centering={self.centering}, std_balance_degrees={self.std_balance_degrees})"
 
-    @torch.cuda.amp.autocast(enabled=False)
     def forward(self, node_input, batch=None):
         """
         Assume input is of shape [N, sphere_basis, C]
@@ -1425,40 +1813,6 @@ def gaussian(x, mean, std):
     return torch.exp(-0.5 * (((x - mean) / std) ** 2)) / (a * std)
 
 
-from fairchem.core.common.utils import (
-    compute_neighbors,
-    get_max_neighbors_mask,
-    get_pbc_distances,
-)
-
-
-class RadialFunction(nn.Module):
-    """
-    Contruct a radial function (linear layers + layer normalization + SiLU) given a list of channels
-    """
-
-    def __init__(self, channels_list, use_layer_norm=True):
-        super().__init__()
-        modules = []
-        input_channels = channels_list[0]
-        for i in range(len(channels_list)):
-            if i == 0:
-                continue
-
-            modules.append(nn.Linear(input_channels, channels_list[i], bias=True))
-            input_channels = channels_list[i]
-
-            if i == len(channels_list) - 1:
-                break
-            if use_layer_norm:
-                modules.append(nn.LayerNorm(channels_list[i]))
-            modules.append(torch.nn.SiLU())
-
-        self.net = nn.Sequential(*modules)
-
-    def forward(self, inputs):
-        return self.net(inputs)
-
 
 # From Graphormer
 class GaussianRadialBasisLayer(torch.nn.Module):
@@ -1547,279 +1901,7 @@ class GaussianLayer_Edgetype(nn.Module):
         x_rbf = gaussian(x.float(), mean, std).type_as(self.means.weight)
         return x_rbf.reshape(out_shape+(-1,))
 
-# class CosineCutoff(nn.Module):
-#     def __init__(self, cutoff_lower=0.0, cutoff_upper=5.0):
-#         super(CosineCutoff, self).__init__()
-#         self.cutoff_lower = cutoff_lower
-#         self.cutoff_upper = cutoff_upper
 
-#     def forward(self, distances):
-#         if self.cutoff_lower > 0:
-#             cutoffs = 0.5 * (
-#                 torch.cos(
-#                     math.pi
-#                     * (
-#                         2
-#                         * (distances - self.cutoff_lower)
-#                         / (self.cutoff_upper - self.cutoff_lower)
-#                         + 1.0
-#                     )
-#                 )
-#                 + 1.0
-#             )
-#             # remove contributions below the cutoff radius
-#             cutoffs = cutoffs * (distances < self.cutoff_upper).float()
-#             cutoffs = cutoffs * (distances > self.cutoff_lower).float()
-#             return cutoffs
-#         else:
-#             cutoffs = 0.5 * (torch.cos(distances * math.pi / self.cutoff_upper) + 1.0)
-#             # remove contributions beyond the cutoff radius
-#             cutoffs = cutoffs * (distances < self.cutoff_upper).float()
-#             return cutoffs
-
-
-# in farchem, the max_rep = [rep_a1.max(), rep_a2.max(), rep_a3.max()] is very big for some special case in oc20 dataset
-# thus we use the max_rep clip to avoid this issue
-def radius_graph_pbc(
-    data,
-    radius,
-    max_num_neighbors_threshold,
-    enforce_max_neighbors_strictly: bool = False,
-    rep_clip: int = 5,
-    pbc=None,
-):
-    if pbc is None:
-        pbc = [True, True, True]
-    device = data.pos.device
-    batch_size = len(data.natoms)
-
-    if hasattr(data, "pbc"):
-        data.pbc = torch.atleast_2d(data.pbc)
-        for i in range(3):
-            if not torch.any(data.pbc[:, i]).item():
-                pbc[i] = False
-            elif torch.all(data.pbc[:, i]).item():
-                pbc[i] = True
-            else:
-                raise RuntimeError(
-                    "Different structures in the batch have different PBC configurations. This is not currently supported."
-                )
-
-    # position of the atoms
-    atom_pos = data.pos
-
-    # Before computing the pairwise distances between atoms, first create a list of atom indices to compare for the entire batch
-    num_atoms_per_image = data.natoms
-    num_atoms_per_image_sqr = (num_atoms_per_image**2).long()
-
-    # index offset between images
-    index_offset = torch.cumsum(num_atoms_per_image, dim=0) - num_atoms_per_image
-
-    index_offset_expand = torch.repeat_interleave(index_offset, num_atoms_per_image_sqr)
-    num_atoms_per_image_expand = torch.repeat_interleave(
-        num_atoms_per_image, num_atoms_per_image_sqr
-    )
-
-    # Compute a tensor containing sequences of numbers that range from 0 to num_atoms_per_image_sqr for each image
-    # that is used to compute indices for the pairs of atoms. This is a very convoluted way to implement
-    # the following (but 10x faster since it removes the for loop)
-    # for batch_idx in range(batch_size):
-    #    batch_count = torch.cat([batch_count, torch.arange(num_atoms_per_image_sqr[batch_idx], device=device)], dim=0)
-    num_atom_pairs = torch.sum(num_atoms_per_image_sqr)
-    index_sqr_offset = (
-        torch.cumsum(num_atoms_per_image_sqr, dim=0) - num_atoms_per_image_sqr
-    )
-    index_sqr_offset = torch.repeat_interleave(
-        index_sqr_offset, num_atoms_per_image_sqr
-    )
-    atom_count_sqr = torch.arange(num_atom_pairs, device=device) - index_sqr_offset
-
-    # Compute the indices for the pairs of atoms (using division and mod)
-    # If the systems get too large this apporach could run into numerical precision issues
-    index1 = (
-        torch.div(atom_count_sqr, num_atoms_per_image_expand, rounding_mode="floor")
-    ) + index_offset_expand
-    index2 = (atom_count_sqr % num_atoms_per_image_expand) + index_offset_expand
-    # Get the positions for each atom
-    pos1 = torch.index_select(atom_pos, 0, index1)
-    pos2 = torch.index_select(atom_pos, 0, index2)
-
-    # # Calculate required number of unit cells in each direction.
-    # Smallest distance between planes separated by a1 is
-    # 1 / ||(a2 x a3) / V||_2, since a2 x a3 is the area of the plane.
-    # Note that the unit cell volume V = a1 * (a2 x a3) and that
-    # (a2 x a3) / V is also the reciprocal primitive vector
-    # (crystallographer's definition).
-
-    cross_a2a3 = torch.cross(data.cell[:, 1], data.cell[:, 2], dim=-1)
-    cell_vol = torch.sum(data.cell[:, 0] * cross_a2a3, dim=-1, keepdim=True)
-
-    if pbc[0]:
-        inv_min_dist_a1 = torch.norm(cross_a2a3 / cell_vol, p=2, dim=-1)
-        rep_a1 = torch.ceil(radius * inv_min_dist_a1)
-    else:
-        rep_a1 = data.cell.new_zeros(1)
-
-    if pbc[1]:
-        cross_a3a1 = torch.cross(data.cell[:, 2], data.cell[:, 0], dim=-1)
-        inv_min_dist_a2 = torch.norm(cross_a3a1 / cell_vol, p=2, dim=-1)
-        rep_a2 = torch.ceil(radius * inv_min_dist_a2)
-    else:
-        rep_a2 = data.cell.new_zeros(1)
-
-    if pbc[2]:
-        cross_a1a2 = torch.cross(data.cell[:, 0], data.cell[:, 1], dim=-1)
-        inv_min_dist_a3 = torch.norm(cross_a1a2 / cell_vol, p=2, dim=-1)
-        rep_a3 = torch.ceil(radius * inv_min_dist_a3)
-    else:
-        rep_a3 = data.cell.new_zeros(1)
-
-    # # Take the max over all images for uniformity. This is essentially padding.
-    # # Note that this can significantly increase the number of computed distances
-    # # if the required repetitions are very different between images
-    # # (which they usually are). Changing this to sparse (scatter) operations
-    # # might be worth the effort if this function becomes a bottleneck.
-    max_rep = [
-        rep_a1.max().clip(max=rep_clip),
-        rep_a2.max().clip(max=rep_clip),
-        rep_a3.max().clip(max=rep_clip),
-    ]
-    # max_rep = [rep_clip,rep_clip,rep_clip]
-    # print(max_rep)
-    # Tensor of unit cells
-    cells_per_dim = [
-        torch.arange(-rep, rep + 1, device=device, dtype=data.cell.dtype)
-        for rep in max_rep
-    ]
-    unit_cell = torch.cartesian_prod(*cells_per_dim)
-    num_cells = len(unit_cell)
-    unit_cell_per_atom = unit_cell.view(1, num_cells, 3).repeat(len(index2), 1, 1)
-    unit_cell = torch.transpose(unit_cell, 0, 1)
-    unit_cell_batch = unit_cell.view(1, 3, num_cells).expand(batch_size, -1, -1)
-
-    # Compute the x, y, z positional offsets for each cell in each image
-    data_cell = torch.transpose(data.cell, 1, 2)
-    pbc_offsets = torch.bmm(data_cell, unit_cell_batch)
-    pbc_offsets_per_atom = torch.repeat_interleave(
-        pbc_offsets, num_atoms_per_image_sqr, dim=0
-    )
-
-    # Expand the positions and indices for the 9 cells
-    pos1 = pos1.view(-1, 3, 1).expand(-1, -1, num_cells)
-    pos2 = pos2.view(-1, 3, 1).expand(-1, -1, num_cells)
-    index1 = index1.view(-1, 1).repeat(1, num_cells).view(-1)
-    index2 = index2.view(-1, 1).repeat(1, num_cells).view(-1)
-    # Add the PBC offsets for the second atom
-    pos2 = pos2 + pbc_offsets_per_atom
-
-    # Compute the squared distance between atoms
-    atom_distance_sqr = torch.sum((pos1 - pos2) ** 2, dim=1)
-    atom_distance_sqr = atom_distance_sqr.view(-1)
-
-    # Remove pairs that are too far apart
-    mask_within_radius = torch.le(atom_distance_sqr, radius * radius)
-    # Remove pairs with the same atoms (distance = 0.0)
-    mask_not_same = torch.gt(atom_distance_sqr, 0.0001)
-    mask = torch.logical_and(mask_within_radius, mask_not_same)
-    index1 = torch.masked_select(index1, mask)
-    index2 = torch.masked_select(index2, mask)
-    unit_cell = torch.masked_select(
-        unit_cell_per_atom.view(-1, 3), mask.view(-1, 1).expand(-1, 3)
-    )
-    unit_cell = unit_cell.view(-1, 3)
-    atom_distance_sqr = torch.masked_select(atom_distance_sqr, mask)
-
-    mask_num_neighbors, num_neighbors_image = get_max_neighbors_mask(
-        natoms=data.natoms,
-        index=index1,
-        atom_distance=atom_distance_sqr,
-        max_num_neighbors_threshold=max_num_neighbors_threshold,
-        enforce_max_strictly=enforce_max_neighbors_strictly,
-    )
-
-    if not torch.all(mask_num_neighbors):
-        # Mask out the atoms to ensure each atom has at most max_num_neighbors_threshold neighbors
-        index1 = torch.masked_select(index1, mask_num_neighbors)
-        index2 = torch.masked_select(index2, mask_num_neighbors)
-        unit_cell = torch.masked_select(
-            unit_cell.view(-1, 3), mask_num_neighbors.view(-1, 1).expand(-1, 3)
-        )
-        unit_cell = unit_cell.view(-1, 3)
-
-    edge_index = torch.stack((index2, index1))
-
-    return edge_index, unit_cell, num_neighbors_image
-
-
-def generate_graph(
-    data,
-    cutoff,
-    max_neighbors=None,
-    use_pbc=None,
-    otf_graph=None,
-    enforce_max_neighbors_strictly=True,
-):
-    if not otf_graph:
-        try:
-            edge_index = data.edge_index
-            if use_pbc:
-                cell_offsets = data.cell_offsets
-                neighbors = data.neighbors
-
-        except AttributeError:
-            logging.warning(
-                "Turning otf_graph=True as required attributes not present in data object"
-            )
-            otf_graph = True
-
-    if use_pbc:
-        if otf_graph:
-            edge_index, cell_offsets, neighbors = radius_graph_pbc(
-                data,
-                cutoff,
-                max_neighbors,
-                enforce_max_neighbors_strictly,
-            )
-
-        out = get_pbc_distances(
-            data.pos,
-            edge_index,
-            data.cell,
-            cell_offsets,
-            neighbors,
-            return_offsets=True,
-            return_distance_vec=True,
-        )
-
-        edge_index = out["edge_index"]
-        edge_dist = out["distances"]
-        cell_offset_distances = out["offsets"]
-        distance_vec = out["distance_vec"]
-    else:
-        if otf_graph:
-            edge_index = radius_graph(
-                data.pos,
-                r=cutoff,
-                batch=data.batch,
-                max_num_neighbors=max_neighbors,
-            )
-
-        j, i = edge_index
-        distance_vec = data.pos[j] - data.pos[i]
-
-        edge_dist = distance_vec.norm(dim=-1)
-        cell_offsets = torch.zeros(edge_index.shape[1], 3, device=data.pos.device)
-        cell_offset_distances = torch.zeros_like(cell_offsets, device=data.pos.device)
-        neighbors = compute_neighbors(data, edge_index)
-
-    return (
-        edge_index,
-        edge_dist,
-        distance_vec,
-        cell_offsets,
-        cell_offset_distances,
-        neighbors,
-    )
 
 
 def construct_o3irrps(dim, order):
@@ -1843,80 +1925,65 @@ def construct_o3irrps_base(dim, order):
     return "+".join(string)
 
 
-def polynomial(dist: torch.Tensor, cutoff: float) -> torch.Tensor:
-    """
-    Polynomial cutoff function,ref: https://arxiv.org/abs/2204.13639
-    Args:
-        dist (tf.Tensor): distance tensor
-        cutoff (float): cutoff distance
-    Returns: polynomial cutoff functions
-    """
-    ratio = torch.div(dist, cutoff)
-    result = (
-        1
-        - 6 * torch.pow(ratio, 5)
-        + 15 * torch.pow(ratio, 4)
-        - 10 * torch.pow(ratio, 3)
+# def polynomial(dist: torch.Tensor, cutoff: float):
+#     """
+#     Polynomial cutoff function,ref: https://arxiv.org/abs/2204.13639
+#     Args:
+#         dist (tf.Tensor): distance tensor
+#         cutoff (float): cutoff distance
+#     Returns: polynomial cutoff functions
+#     """
+#     ratio = torch.div(dist, cutoff)
+#     result = (
+#         1
+#         - 6 * torch.pow(ratio, 5)
+#         + 15 * torch.pow(ratio, 4)
+#         - 10 * torch.pow(ratio, 3)
+#     )
+#     return torch.clamp(result, min=0.0)
+
+        
+def polynomial(dist: torch.Tensor, cutoff: float, exponent: int = 5) -> torch.Tensor:
+    a: float = -(exponent + 1) * (exponent + 2) / 2
+    b: float = exponent * (exponent + 2)
+    c: float = -exponent * (exponent + 1) / 2
+    ratio = dist/cutoff
+    env_val = 1 + ratio**exponent * (
+        a + ratio * (b + c * ratio)
     )
-    return torch.clamp(result, min=0.0)
+    return torch.where(ratio<1, env_val, 0)
 
-def mace_polynomial(dist: torch.Tensor, cutoff: float) -> torch.Tensor:
+def smooth_polynomial_bell(dist, cutoff_min, cutoff_max, exponent=2):
     """
-    MACE polynomial cutoff, equivalent to PolynomialCutoff(r_max=cutoff, p=6).
-    Produces 1 at r=0 and smoothly goes to 0 at r=cutoff.
+    Construct a smooth bell-shaped polynomial function on the interval [x, y]: f(x) = 0, f(y) = 0, f(mid) = 1
+    Use: f(t) = (1 - t^2)^exponent, where t is normalized to [-1, 1] 
+    Parameters:
+        z (Tensor): Input tensor of any shape
+        x (float or Tensor): Left endpoint of the interval
+        y (float or Tensor): Right endpoint of the interval
+        exponent (int): Controls the steepness of the peak, recommended values are 2 (default), 3, 4 
+    Tensor: shape is the same as z, values are within [0, 1]
     """
-    p = 5
-    r_over_rmax = dist / cutoff
+    
+    if not isinstance(cutoff_min, torch.Tensor):
+        cutoff_min = torch.tensor(cutoff_min, dtype=dist.dtype, device=dist.device)
+    if not isinstance(cutoff_max, torch.Tensor):
+        cutoff_max = torch.tensor(cutoff_max, dtype=dist.dtype, device=dist.device)
 
-    # Equation from MACE polynomial cutoff
-    envelope = (
-        1.0
-        - ((p + 1.0) * (p + 2.0) / 2.0) * r_over_rmax**p
-        + p * (p + 2.0) * r_over_rmax**(p + 1)
-        - (p * (p + 1.0) / 2.0) * r_over_rmax**(p + 2)
-    )
+    
+    eps = 1e-8
+    cutoff_max = torch.maximum(cutoff_max, cutoff_min + eps)
 
-    envelope = envelope * (dist < cutoff)
+    
+    t = (2 * dist - (cutoff_min + cutoff_max)) / (cutoff_max - cutoff_min)  
 
-    return torch.clamp(envelope, min=0.0)
+    
+    t = torch.clamp(t, -1.0, 1.0)
 
-def mace_polynomial_window(dist: torch.Tensor,
-                           cutoff_lower: float,
-                           cutoff_upper: float) -> torch.Tensor:
-    """
-    MACE polynomial cutoff extended to a window [cutoff_lower, cutoff_upper].
-    Output:
-        1 when dist <= cutoff_lower
-        0 when dist >= cutoff_upper
-        smooth transition (MACE polynomial) inside the window.
-    """
+    
+    f_t = (1.0 - t**2) ** exponent
 
-    assert cutoff_lower < cutoff_upper
-    p = 5
-
-    # ---- Rescale dist into [0, 1] for the polynomial ----
-    # x = 0 → dist = cutoff_lower
-    # x = 1 → dist = cutoff_upper
-    x = (dist - cutoff_lower) / (cutoff_upper - cutoff_lower)
-
-    # polynomial only valid on [0, 1]
-    x_clamped = torch.clamp(x, 0.0, 1.0)
-
-    # MACE polynomial envelope on [0,1]
-    envelope = (
-        1.0
-        - ((p + 1.0) * (p + 2.0) / 2.0) * x_clamped**p
-        + p * (p + 2.0) * x_clamped**(p + 1)
-        - (p * (p + 1.0) / 2.0) * x_clamped**(p + 2)
-    )
-
-    # outside range: enforce hard boundaries
-    envelope = envelope * (x <= 1.0)
-    envelope = torch.where(x <= 0.0, torch.ones_like(envelope), envelope)
-
-    return torch.clamp(envelope, 0.0, 1.0)
-
-
+    return f_t
 
 def SmoothSoftmax(input, edge_dis, max_dist=5.0, dim=2, eps=1e-5, batched_data=None):
     local_attn_weight = polynomial(edge_dis, max_dist)
@@ -1929,8 +1996,7 @@ def SmoothSoftmax(input, edge_dis, max_dist=5.0, dim=2, eps=1e-5, batched_data=N
     # e_ij = input * local_attn_weight.unsqueeze(-1)
 
     if torch.isnan(e_ij).any() or torch.isinf(e_ij).any():
-        print("e_ij has nan or inf")
-        print(e_ij)
+        logger.warning("e_ij has nan or inf: {}", e_ij)
     # Compute softmax along the last dimension
     softmax = e_ij / (torch.sum(e_ij, dim=dim, keepdim=True) + eps)
     # softmax = torch.nn.functional.softmax(e_ij, dim=dim)
@@ -1939,34 +2005,6 @@ def SmoothSoftmax(input, edge_dis, max_dist=5.0, dim=2, eps=1e-5, batched_data=N
 
     return softmax
 
-
-# def SmoothSoftmax(input, mask, max_dist=5.0, eps: float = 1e-16):
-#     # Invert distances to ensure smaller distances get higher weights
-#     # No need to mask out the 1000 values, they will naturally get near-zero weights
-#     mask = mask.squeeze(-1)
-#     input = input.masked_fill(mask, 1000)
-#     inverted_input = max_dist - input
-
-#     # Compute the maximum value for numerical stability
-#     max_value = inverted_input.max(dim=-1, keepdim=True).values
-
-#     # Shift the input by subtracting the maximum value to avoid overflow during exponentiation
-#     shifted_input = inverted_input - max_value
-
-#     # Compute e_ij (exponential of the shifted input)
-#     e_ij = torch.exp(shifted_input)
-
-#     # Check for NaN or infinite values
-#     if torch.isnan(e_ij).any() or torch.isinf(e_ij).any():
-#         print("e_ij has nan or inf")
-#         print(e_ij)
-
-#     # Compute Softmax
-#     coeff = (mask.shape[-1] - mask.sum(-1)).unsqueeze(-1)
-#     softmax = e_ij / (torch.sum(e_ij, dim=-1, keepdim=True) + eps) * coeff
-#     softmax = softmax.masked_fill(mask, 1e-6)
-
-#     return softmax
 
 
 class SO3_Linear_e2former(torch.nn.Module):
@@ -1992,7 +2030,7 @@ class SO3_Linear_e2former(torch.nn.Module):
             start_idx = l**2
             length = 2 * l + 1
             expand_index[start_idx : (start_idx + length)] = l
-        self.register_buffer("expand_index", expand_index)
+        self.register_buffer("expand_index", expand_index,persistent=False)
 
     def forward(self, input_embedding):
         output_shape = input_embedding.shape[:-2]
@@ -2017,33 +2055,33 @@ class SO3_Linear_e2former(torch.nn.Module):
         return f"{self.__class__.__name__}(in_features={self.in_features}, out_features={self.out_features}, lmax={self.lmax})"
 
 
-class Learn_PolynomialDistance(torch.nn.Module):
-    def __init__(self, degree, highest_degree=3):
-        """
-        Constructs a polynomial model with learnable coefficients.
+# class Learn_PolynomialDistance(torch.nn.Module):
+#     def __init__(self, degree, highest_degree=3):
+#         """
+#         Constructs a polynomial model with learnable coefficients.
 
-        P(d) = c_0 + c_1 * d + c_2 * d^2 + ... + c_n * d^n
+#         P(d) = c_0 + c_1 * d + c_2 * d^2 + ... + c_n * d^n
 
-        :param degree: The highest degree of the polynomial.
-        """
-        super().__init__()
-        self.coefficients = 0.01 * torch.randn(highest_degree + 1)
-        self.coefficients[degree] = 1
+#         :param degree: The highest degree of the polynomial.
+#         """
+#         super().__init__()
+#         self.coefficients = 0.01 * torch.randn(highest_degree + 1)
+#         self.coefficients[degree] = 1
 
-        self.coefficients = torch.nn.Parameter(self.coefficients)
-        self.act = torch.nn.ReLU()
+#         self.coefficients = torch.nn.Parameter(self.coefficients)
+#         self.act = torch.nn.ReLU()
 
-    def forward(self, distance):
-        """
-        Computes the polynomial value for a given distance.
+#     def forward(self, distance):
+#         """
+#         Computes the polynomial value for a given distance.
 
-        :param distance: The distance value (torch.Tensor)
-        :return: The computed polynomial value.
-        """
-        powers = torch.stack(
-            [distance**i for i in range(len(self.coefficients))], dim=-1
-        )
-        return self.act(torch.sum(self.coefficients * powers, dim=-1))
+#         :param distance: The distance value (torch.Tensor)
+#         :return: The computed polynomial value.
+#         """
+#         powers = torch.stack(
+#             [distance**i for i in range(len(self.coefficients))], dim=-1
+#         )
+#         return self.act(torch.sum(self.coefficients * powers, dim=-1))
 
 
 def drop_path_BL(x, drop_prob: float = 0.0, training: bool = False):
@@ -2153,22 +2191,12 @@ class SmoothLeakyReLU(torch.nn.Module):
         return "negative_slope={}".format(self.alpha)
 
 
-# class SmoothLeakyReLU(torch.nn.Module):
-#     def __init__(self, negative_slope=0.2):
-#         super().__init__()
-#         self.alpha = 0.3 #negative_slope
-#         self.func = nn.SiLU()
-#     def forward(self, x):
-#         ## x could be any dimension.
-#         return self.func(x)
-#         # return (1-self.alpha) * x * torch.sigmoid(x) + self.alpha * x
 
-#     def extra_repr(self):
-#         return "negative_slope={}".format(self.alpha)
+
 
 
 class SO3_Linear2Scalar_e2former(torch.nn.Module):
-    def __init__(self, in_features, out_features, lmax, bias=True):
+    def __init__(self, in_features, out_features, lmax, hidden_features = None,bias=True):
         """
         1. Use `torch.einsum` to prevent slicing and concatenation
         2. Need to specify some behaviors in `no_weight_decay` and weight initialization.
@@ -2177,20 +2205,20 @@ class SO3_Linear2Scalar_e2former(torch.nn.Module):
         self.in_features = in_features
         self.out_features = out_features
         self.lmax = lmax
-
+        hidden_features = out_features // 2 if hidden_features is None else hidden_features
         self.weight = torch.nn.Parameter(
-            torch.randn((self.lmax + 1), out_features // 2, in_features)
+            torch.randn((self.lmax + 1), hidden_features, in_features)
         )
         bound = 1 / math.sqrt(self.in_features)
         torch.nn.init.uniform_(self.weight, -bound, bound)
-        self.bias = torch.nn.Parameter(torch.zeros(out_features // 2))
+        self.bias = torch.nn.Parameter(torch.zeros(hidden_features))
 
         self.weight2 = torch.nn.Parameter(
-            torch.randn((self.lmax + 1), out_features // 2, in_features)
+            torch.randn((self.lmax + 1), hidden_features, in_features)
         )
         bound = 1 / math.sqrt(self.in_features)
         torch.nn.init.uniform_(self.weight2, -bound, bound)
-        self.bias = torch.nn.Parameter(torch.zeros(1, 1, out_features // 2))
+        self.bias = torch.nn.Parameter(torch.zeros(1, 1, hidden_features))
 
         expand_index = torch.zeros([(lmax + 1) ** 2]).long()
         for l in range(lmax + 1):
@@ -2200,10 +2228,10 @@ class SO3_Linear2Scalar_e2former(torch.nn.Module):
         self.register_buffer("expand_index", expand_index)
 
         self.final_linear = nn.Sequential(
-            nn.Linear(out_features // 2 * (lmax + 1), out_features),
-            nn.LayerNorm(out_features),
+            nn.Linear(hidden_features * (lmax + 1), hidden_features),
+            nn.LayerNorm(hidden_features),
             nn.SiLU(),
-            nn.Linear(out_features, out_features),
+            nn.Linear(hidden_features, out_features),
         )
 
     def forward(self, input_embedding):
@@ -2244,446 +2272,6 @@ class SO3_Linear2Scalar_e2former(torch.nn.Module):
         return tmp_out
 
 
-class Irreps2Scalar(torch.nn.Module):
-    def __init__(
-        self,
-        irreps_in,
-        out_dim,
-        hidden_dim=None,
-        bias=True,
-        act="smoothleakyrelu",
-        rescale=True,
-    ):
-        """
-        1. from irreps to scalar output: [...,irreps] - > [...,out_dim]
-        2. bias is used for l=0
-        3. act is used for l=0
-        4. rescale is default, e.g. irreps is c0*l0+c1*l1+c2*l2+c3*l3, rescale weight is 1/c0**0.5 1/c1**0.5 ...
-        """
-        super().__init__()
-        self.irreps_in = (
-            o3.Irreps(irreps_in) if isinstance(irreps_in, str) else irreps_in
-        )
-        if hidden_dim is not None:
-            self.hidden_dim = hidden_dim
-        else:
-            self.hidden_dim = self.irreps_in[0][0]  # l=0 scalar_dim
-        self.out_dim = out_dim
-        self.act = act
-        self.bias = bias
-        self.rescale = rescale
-
-        self.vec_proj_list = nn.ModuleList()
-        # self.irreps_in_len = sum([mul*(ir.l*2+1) for mul, ir in self.irreps_in])
-        # self.scalar_in_len = sum([mul for mul, ir in self.irreps_in])
-        self.lirreps = len(self.irreps_in)
-        self.output_mlp = nn.Sequential(
-            SmoothLeakyReLU(0.2) if self.act == "smoothleakyrelu" else nn.Identity(),
-            nn.Linear(self.hidden_dim, out_dim),  # NOTICE init
-        )
-
-        for idx in range(len(self.irreps_in)):
-            l = self.irreps_in[idx][1].l
-            in_feature = self.irreps_in[idx][0]
-            if l == 0:
-                vec_proj = nn.Linear(in_feature, self.hidden_dim)
-                # bound = 1 / math.sqrt(in_feature)
-                # torch.nn.init.uniform_(vec_proj.weight, -bound, bound)
-                nn.init.xavier_uniform_(vec_proj.weight)
-                vec_proj.bias.data.fill_(0)
-            else:
-                vec_proj = nn.Linear(in_feature, 2 * (self.hidden_dim), bias=False)
-                # bound = 1 / math.sqrt(in_feature*(2*l+1))
-                # torch.nn.init.uniform_(vec_proj.weight, -bound, bound)
-                nn.init.xavier_uniform_(vec_proj.weight)
-            self.vec_proj_list.append(vec_proj)
-
-    def forward(self, input_embedding):
-        """
-        from e3nn import o3
-        irreps_in = o3.Irreps("100x1e+40x2e+10x3e")
-        irreps_out = o3.Irreps("20x1e+20x2e+20x3e")
-        irrepslinear = IrrepsLinear(irreps_in, irreps_out)
-        irreps2scalar = Irreps2Scalar(irreps_in, 128)
-        node_embed = irreps_in.randn(200,30,5,-1)
-        out_scalar = irreps2scalar(node_embed)
-        out_irreps = irrepslinear(node_embed)
-        """
-
-        # if input_embedding.shape[-1]!=self.irreps_in_len:
-        #     raise ValueError("input_embedding should have same length as irreps_in_len")
-
-        shape = list(input_embedding.shape[:-1])
-        num = input_embedding.shape[:-1].numel()
-        input_embedding = input_embedding.reshape(num, -1)
-
-        start_idx = 0
-        scalars = 0
-        for idx, (mul, ir) in enumerate(self.irreps_in):
-            if idx == 0 and ir.l == 0:
-                scalars = self.vec_proj_list[0](
-                    input_embedding[..., : self.irreps_in[0][0]]
-                )
-                start_idx += mul * (2 * ir.l + 1)
-                continue
-            vec_proj = self.vec_proj_list[idx]
-            vec = (
-                input_embedding[:, start_idx : start_idx + mul * (2 * ir.l + 1)]
-                .reshape(-1, mul, (2 * ir.l + 1))
-                .permute(0, 2, 1)
-            )  # [B, 2l+1, D]
-            vec1, vec2 = torch.split(
-                vec_proj(vec), self.hidden_dim, dim=-1
-            )  # [B, 2l+1, D]
-            vec_dot = (vec1 * vec2).sum(dim=1)  # [B, 2l+1, D]
-
-            scalars = scalars + vec_dot  # TODO: concat
-            start_idx += mul * (2 * ir.l + 1)
-
-        output_embedding = self.output_mlp(scalars)
-        output_embedding = output_embedding.reshape(shape + [self.out_dim])
-        return output_embedding
-
-    def __repr__(self):
-        return f"{self.__class__.__name__}(in_features={self.irreps_in}, out_features={self.out_dim}"
-
-
-# class IrrepsLinear(torch.nn.Module):
-#     def __init__(
-#         self,
-#         irreps_in,
-#         irreps_out,
-#         hidden_dim=None,
-#         bias=True,
-#         act="smoothleakyrelu",
-#         rescale=_RESCALE,
-#     ):
-#         """
-#         1. from irreps to scalar output: [...,irreps] - > [...,out_dim]
-#         2. bias is used for l=0
-#         3. act is used for l=0
-#         4. rescale is default, e.g. irreps is c0*l0+c1*l1+c2*l2+c3*l3, rescale weight is 1/c0**0.5 1/c1**0.5 ...
-#         """
-#         super().__init__()
-#         self.irreps_in = o3.Irreps(irreps_in) if isinstance(irreps_in,str) else irreps_in
-#         self.irreps_out = o3.Irreps(irreps_out) if isinstance(irreps_out,str) else irreps_out
-
-#         self.irreps_in_len = sum([mul*(ir.l*2+1) for mul, ir in self.irreps_in])
-#         self.irreps_out_len = sum([mul*(ir.l*2+1) for mul, ir in self.irreps_out])
-#         if hidden_dim is not None:
-#             self.hidden_dim = hidden_dim
-#         else:
-#             self.hidden_dim = self.irreps_in[0][0]  # l=0 scalar_dim
-#         self.act = act
-#         self.bias = bias
-#         self.rescale = rescale
-
-#         self.vec_proj_list = nn.ModuleList()
-#         # self.irreps_in_len = sum([mul*(ir.l*2+1) for mul, ir in self.irreps_in])
-#         # self.scalar_in_len = sum([mul for mul, ir in self.irreps_in])
-#         self.output_mlp = nn.Sequential(
-#             SmoothLeakyReLU(0.2) if self.act == "smoothleakyrelu" else nn.Identity(),
-#             nn.Linear(self.hidden_dim, self.irreps_out[0][0]),
-#         )
-#         self.weight_list = nn.ParameterList()
-#         for idx in range(len(self.irreps_in)):
-#             l = self.irreps_in[idx][1].l
-#             in_feature = self.irreps_in[idx][0]
-#             if l == 0:
-#                 vec_proj = nn.Linear(in_feature, self.hidden_dim)
-#                 nn.init.xavier_uniform_(vec_proj.weight)
-#                 vec_proj.bias.data.fill_(0)
-#             else:
-#                 vec_proj = nn.Linear(in_feature, 2 * self.hidden_dim, bias=False)
-#                 nn.init.xavier_uniform_(vec_proj.weight)
-
-#                 # weight for l>0
-#                 out_feature = self.irreps_out[idx][0]
-#                 weight = torch.nn.Parameter(
-#                                 torch.randn( out_feature,in_feature)
-#                             )
-#                 bound = 1 / math.sqrt(in_feature) if self.rescale else 1
-#                 torch.nn.init.uniform_(weight, -bound, bound)
-#                 self.weight_list.append(weight)
-
-#             self.vec_proj_list.append(vec_proj)
-
-
-#     def forward(self, input_embedding):
-#         """
-#         from e3nn import o3
-#         irreps_in = o3.Irreps("100x1e+40x2e+10x3e")
-#         irreps_out = o3.Irreps("20x1e+20x2e+20x3e")
-#         irrepslinear = IrrepsLinear(irreps_in, irreps_out)
-#         irreps2scalar = Irreps2Scalar(irreps_in, 128)
-#         node_embed = irreps_in.randn(200,30,5,-1)
-#         out_scalar = irreps2scalar(node_embed)
-#         out_irreps = irrepslinear(node_embed)
-#         """
-
-#         # if input_embedding.shape[-1]!=self.irreps_in_len:
-#         #     raise ValueError("input_embedding should have same length as irreps_in_len")
-
-#         shape = list(input_embedding.shape[:-1])
-#         num = input_embedding.shape[:-1].numel()
-#         input_embedding = input_embedding.reshape(num, -1)
-
-#         start_idx = 0
-#         scalars = self.vec_proj_list[0](input_embedding[..., : self.irreps_in[0][0]])
-#         output_embedding = []
-#         for idx, (mul, ir) in enumerate(self.irreps_in):
-#             if idx == 0:
-#                 start_idx += mul * (2 * ir.l + 1)
-#                 continue
-#             vec_proj = self.vec_proj_list[idx]
-#             vec = (
-#                 input_embedding[:, start_idx : start_idx + mul * (2 * ir.l + 1)]
-#                 .reshape(-1, mul, (2 * ir.l + 1))
-#             )  # [B, D, 2l+1]
-#             vec1, vec2 = torch.split(
-#                 vec_proj(vec.permute(0, 2, 1)), self.hidden_dim, dim=-1
-#             )  # [B, 2l+1, D]
-#             vec_dot = (vec1 * vec2).sum(dim=1)  # [B, 2l+1, D]
-
-#             scalars = scalars + vec_dot # TODO: concat
-
-#             # linear for l>0
-#             weight = self.weight_list[idx-1]
-#             out = torch.matmul(weight,vec).reshape(num,-1) # [B*L, -1]
-#             output_embedding.append(out)
-
-#             start_idx += mul * (2 * ir.l + 1)
-#         try:
-#             scalars = self.output_mlp(scalars)
-#         except:
-#             raise ValueError(f"scalars shape: {scalars.shape}")
-#         output_embedding.insert(0, scalars)
-#         output_embedding = torch.cat(output_embedding, dim=1)
-#         output_embedding = output_embedding.reshape(shape + [self.irreps_out_len])
-#         return output_embedding
-
-#     def __repr__(self):
-#         return f"{self.__class__.__name__}(in_features={self.irreps_in}, out_features={self.irreps_out}"
-
-
-class IrrepsLinear(torch.nn.Module):
-    def __init__(
-        self, irreps_in, irreps_out, bias=True, act="smoothleakyrelu", rescale=True
-    ):
-        """
-        1. from irreps_in to irreps_out output: [...,irreps_in] - > [...,irreps_out]
-        2. bias is used for l=0
-        3. act is used for l=0
-        4. rescale is default, e.g. irreps is c0*l0+c1*l1+c2*l2+c3*l3, rescale weight is 1/c0**0.5 1/c1**0.5 ...
-        """
-        super().__init__()
-        self.irreps_in = (
-            o3.Irreps(irreps_in) if isinstance(irreps_in, str) else irreps_in
-        )
-        self.irreps_out = (
-            o3.Irreps(irreps_out) if isinstance(irreps_out, str) else irreps_out
-        )
-
-        self.act = act
-        self.bias = bias
-        self.rescale = rescale
-
-        for idx2 in range(len(self.irreps_out)):
-            if self.irreps_out[idx2][1] not in self.irreps_in:
-                raise ValueError(
-                    f"Error: each irrep of irreps_out {self.irreps_out} should be in irreps_in {self.irreps_in}. Please check your input and output "
-                )
-
-        self.weight_list = nn.ParameterList()
-        self.bias_list = nn.ParameterList()
-        self.act_list = nn.ModuleList()
-        self.irreps_in_len = sum([mul * (ir.l * 2 + 1) for mul, ir in self.irreps_in])
-        self.irreps_out_len = sum([mul * (ir.l * 2 + 1) for mul, ir in self.irreps_out])
-        self.instructions = []
-        start_idx = 0
-        for idx1 in range(len(self.irreps_in)):
-            l = self.irreps_in[idx1][1].l
-            mul = self.irreps_in[idx1][0]
-            for idx2 in range(len(self.irreps_out)):
-                if self.irreps_in[idx1][1].l == self.irreps_out[idx2][1].l:
-                    self.instructions.append(
-                        [idx1, mul, l, start_idx, start_idx + (l * 2 + 1) * mul]
-                    )
-                    out_feature = self.irreps_out[idx2][0]
-
-                    weight = torch.nn.Parameter(torch.randn(out_feature, mul))
-                    bound = 1 / math.sqrt(mul) if self.rescale else 1
-                    torch.nn.init.uniform_(weight, -bound, bound)
-                    self.weight_list.append(weight)
-
-                    bias = torch.nn.Parameter(
-                        torch.randn(1, out_feature, 1)
-                        if self.bias and l == 0
-                        else torch.zeros(1, out_feature, 1)
-                    )
-                    self.bias_list.append(bias)
-
-                    activation = (
-                        nn.Sequential(SmoothLeakyReLU())
-                        if self.act == "smoothleakyrelu" and l == 0
-                        else nn.Sequential()
-                    )
-                    self.act_list.append(activation)
-
-            start_idx += (l * 2 + 1) * mul
-
-    def forward(self, input_embedding):
-        """
-        from e3nn import o3
-        irreps_in = o3.Irreps("100x1e+40x2e+10x3e")
-        irreps_out = o3.Irreps("20x1e+20x2e+20x3e")
-        irrepslinear = IrrepsLinear(irreps_in, irreps_out)
-        irreps2scalar = Irreps2Scalar(irreps_in, 128)
-        node_embed = irreps_in.randn(200,30,5,-1)
-        out_scalar = irreps2scalar(node_embed)
-        out_irreps = irrepslinear(node_embed)
-        """
-
-        if input_embedding.shape[-1] != self.irreps_in_len:
-            raise ValueError("input_embedding should have same length as irreps_in_len")
-
-        shape = list(input_embedding.shape[:-1])
-        num = input_embedding.shape[:-1].numel()
-        input_embedding = input_embedding.reshape(num, -1)
-
-        output_embedding = []
-        for idx, (_, mul, l, start, end) in enumerate(self.instructions):
-            weight = self.weight_list[idx]
-            bias = self.bias_list[idx]
-            activation = self.act_list[idx]
-
-            out = (
-                torch.matmul(
-                    weight, input_embedding[:, start:end].reshape(-1, mul, (2 * l + 1))
-                )
-                + bias
-            )
-            out = activation(out).reshape(num, -1)
-            output_embedding.append(out)
-
-        output_embedding = torch.cat(output_embedding, dim=1)
-        output_embedding = output_embedding.reshape(shape + [self.irreps_out_len])
-        return output_embedding
-
-
-@compile_mode("script")
-class Vec2AttnHeads(torch.nn.Module):
-    """
-    Reshape vectors of shape [..., irreps_head] to vectors of shape
-    [..., num_heads, irreps_head].
-    """
-
-    def __init__(self, irreps_head, num_heads):
-        super().__init__()
-        self.num_heads = num_heads
-        self.irreps_head = irreps_head
-        self.irreps_mid_in = []
-        for mul, ir in irreps_head:
-            self.irreps_mid_in.append((mul * num_heads, ir))
-        self.irreps_mid_in = o3.Irreps(self.irreps_mid_in)
-        self.mid_in_indices = []
-        start_idx = 0
-        for mul, ir in self.irreps_mid_in:
-            self.mid_in_indices.append((start_idx, start_idx + mul * ir.dim))
-            start_idx = start_idx + mul * ir.dim
-
-    def forward(self, x):
-        shape = list(x.shape[:-1])
-        num = x.shape[:-1].numel()
-        x = x.reshape(num, -1)
-
-        N, _ = x.shape
-        out = []
-        for ir_idx, (start_idx, end_idx) in enumerate(self.mid_in_indices):
-            temp = x.narrow(1, start_idx, end_idx - start_idx)
-            temp = temp.reshape(N, self.num_heads, -1)
-            out.append(temp)
-        out = torch.cat(out, dim=2)
-        out = out.reshape(shape + [self.num_heads, -1])
-        return out
-
-    def __repr__(self):
-        return "{}(irreps_head={}, num_heads={})".format(
-            self.__class__.__name__, self.irreps_head, self.num_heads
-        )
-
-
-@compile_mode("script")
-class AttnHeads2Vec(torch.nn.Module):
-    """
-    Convert vectors of shape [..., num_heads, irreps_head] into
-    vectors of shape [..., irreps_head * num_heads].
-    """
-
-    def __init__(self, irreps_head, num_heads=-1):
-        super().__init__()
-        self.irreps_head = irreps_head
-        self.num_heads = num_heads
-        self.head_indices = []
-        start_idx = 0
-        for mul, ir in self.irreps_head:
-            self.head_indices.append((start_idx, start_idx + mul * ir.dim))
-            start_idx = start_idx + mul * ir.dim
-
-    def forward(self, x):
-        head_cnt = x.shape[-2]
-        shape = list(x.shape[:-2])
-        num = x.shape[:-2].numel()
-        x = x.reshape(num, head_cnt, -1)
-        N, _, _ = x.shape
-        out = []
-        for ir_idx, (start_idx, end_idx) in enumerate(self.head_indices):
-            temp = x.narrow(2, start_idx, end_idx - start_idx)
-            temp = temp.reshape(N, -1)
-            out.append(temp)
-        out = torch.cat(out, dim=1)
-        out = out.reshape(shape + [-1])
-        return out
-
-    def __repr__(self):
-        return "{}(irreps_head={})".format(self.__class__.__name__, self.irreps_head)
-
-
-# class EquivariantDropout(nn.Module):
-#     def __init__(self, irreps, drop_prob):
-#         """
-#         equivariant for irreps: [..., irreps]
-#         """
-
-#         super(EquivariantDropout, self).__init__()
-#         self.irreps = irreps
-#         self.num_irreps = irreps.num_irreps
-#         self.drop_prob = drop_prob
-#         self.drop = torch.nn.Dropout(drop_prob, True)
-#         self.mul = o3.ElementwiseTensorProduct(
-#             irreps, o3.Irreps("{}x0e".format(self.num_irreps))
-#         )
-
-#     def forward(self, x):
-#         """
-#         x: [..., irreps]
-
-#         t1 = o3.Irreps("5x0e+4x1e+3x2e")
-#         func = EquivariantDropout(t1, 0.5)
-#         out = func(t1.randn(2,3,-1))
-#         """
-#         if not self.training or self.drop_prob == 0.0:
-#             return x
-
-#         shape = x.shape
-#         N = x.shape[:-1].numel()
-#         x = x.reshape(N, -1)
-#         mask = torch.ones((N, self.num_irreps), dtype=x.dtype, device=x.device)
-#         mask = self.drop(mask)
-
-#         out = self.mul(x, mask)
-
-#         return out.reshape(shape)
 
 
 class EquivariantDropout(nn.Module):
@@ -2893,243 +2481,6 @@ class TensorProductRescale(torch.nn.Module):
         out = self.forward_tp_rescale_bias(x, y, weight)
         return out
 
-
-# class SeparableFCTP(torch.nn.Module):
-#     def __init__(
-#         self,
-#         irreps_x,
-#         irreps_y,
-#         irreps_out,
-#         fc_neurons,
-#         use_activation=False,
-#         norm_layer="graph",
-#         internal_weights=False,
-#         mode="default",
-#         connection_mode='uvu',
-#         rescale=True,
-#         eqv2=False
-#     ):
-#         """
-#         Use separable FCTP for spatial convolution.
-#         [...,irreps_x] tp [...,irreps_y] - > [..., irreps_out]
-
-#         fc_neurons is not needed in e2former
-#         """
-
-#         super().__init__()
-#         self.irreps_node_input = o3.Irreps(irreps_x)
-#         self.irreps_edge_attr = o3.Irreps(irreps_y)
-#         self.irreps_node_output = o3.Irreps(irreps_out)
-#         norm = get_norm_layer(norm_layer)
-
-
-#         irreps_output = []
-#         instructions = []
-
-#         for i, (mul, ir_in) in enumerate(self.irreps_node_input):
-#             for j, (_, ir_edge) in enumerate(self.irreps_edge_attr):
-#                 for ir_out in ir_in * ir_edge:
-#                     if ir_out in self.irreps_node_output: # or ir_out == o3.Irrep(0, 1):
-#                         k = len(irreps_output)
-#                         irreps_output.append((mul, ir_out))
-#                         instructions.append((i, j, k, connection_mode, True))
-
-#         irreps_output = o3.Irreps(irreps_output)
-#         irreps_output, p, _ = sort_irreps_even_first(irreps_output)  # irreps_output.sort()
-#         instructions = [
-#             (i_1, i_2, p[i_out], mode, train)
-#             for i_1, i_2, i_out, mode, train in instructions
-#         ]
-#         if mode != "default":
-#             if internal_weights is False:
-#                 raise ValueError("tp not support some parameter, please check your code.")
-
-#         if eqv2==True:
-#             self.dtp = TensorProductRescale(
-#                 self.irreps_node_input,
-#                 self.irreps_edge_attr,
-#                 irreps_output,
-#                 instructions,
-#                 internal_weights=internal_weights,
-#                 shared_weights=True,
-#                 bias=False,
-#                 rescale=rescale,
-#                 mode=mode,
-#             )
-
-
-#             self.dtp_rad = None
-#             self.fc_neurons = fc_neurons
-#             if fc_neurons is not None:
-#                 warnings.warn("NOTICEL: fc_neurons is not needed in e2former")
-#                 self.dtp_rad = RadialProfile(fc_neurons + [self.dtp.tp.irreps_out.num_irreps])
-#                 # for slice, slice_sqrt_k in self.dtp.slices_sqrt_k.values():
-#                 #     self.dtp_rad.net[-1].weight.data[slice, :] *= slice_sqrt_k
-#                 #     self.dtp_rad.offset.data[slice] *= slice_sqrt_k
-
-#             self.norm = None
-
-#             if use_activation:
-#                 irreps_lin_output = self.irreps_node_output
-#                 irreps_scalars, irreps_gates, irreps_gated = irreps2gate(
-#                     self.irreps_node_output
-#                 )
-#                 irreps_lin_output = irreps_scalars + irreps_gates + irreps_gated
-#                 irreps_lin_output = irreps_lin_output.simplify()
-#                 self.lin = IrrepsLinear(
-#                     self.dtp.irreps_out.simplify(), irreps_lin_output, bias=False, act=None
-#                 )
-#                 if norm_layer is not None:
-#                     self.norm = norm(irreps_lin_output)
-
-#             else:
-#                 self.lin = IrrepsLinear(
-#                     self.dtp.irreps_out.simplify(), self.irreps_node_output, bias=False, act=None
-#                 )
-#                 if norm_layer is not None:
-#                     self.norm = norm(self.irreps_node_output)
-
-#             self.gate = None
-#             if use_activation:
-#                 if irreps_gated.num_irreps == 0:
-#                     gate = Activation(self.irreps_node_output, acts=[torch.nn.SiLU()])
-#                 else:
-#                     gate = Gate(
-#                         irreps_scalars,
-#                         [torch.nn.SiLU() for _, ir in irreps_scalars],  # scalar
-#                         irreps_gates,
-#                         [torch.sigmoid for _, ir in irreps_gates],  # gates (scalars)
-#                         irreps_gated,  # gated tensors
-#                     )
-#                 self.gate = gate
-#         else:
-#             self.dtp = TensorProductRescale(
-#                 self.irreps_node_input,
-#                 self.irreps_edge_attr,
-#                 irreps_output,
-#                 instructions,
-#                 internal_weights=internal_weights,
-#                 shared_weights=internal_weights,
-#                 bias=False,
-#                 rescale=rescale,
-#                 mode=mode,
-#             )
-
-
-#             self.dtp_rad = None
-#             self.fc_neurons = fc_neurons
-#             if fc_neurons is not None:
-#                 warnings.warn("NOTICEL: fc_neurons is not needed in e2former")
-#                 self.dtp_rad = RadialProfile(fc_neurons + [self.dtp.tp.weight_numel])
-#                 for slice, slice_sqrt_k in self.dtp.slices_sqrt_k.values():
-#                     self.dtp_rad.net[-1].weight.data[slice, :] *= slice_sqrt_k
-#                     self.dtp_rad.offset.data[slice] *= slice_sqrt_k
-
-#             irreps_lin_output = self.irreps_node_output
-#             irreps_scalars, irreps_gates, irreps_gated = irreps2gate(
-#                 self.irreps_node_output
-#             )
-#             if use_activation:
-#                 irreps_lin_output = irreps_scalars + irreps_gates + irreps_gated
-#                 irreps_lin_output = irreps_lin_output.simplify()
-#             self.lin = IrrepsLinear(
-#                 self.dtp.irreps_out.simplify(), irreps_lin_output, bias=False, act=None
-#             )
-
-#             self.norm = None
-#             if norm_layer is not None:
-#                 self.norm = norm(self.irreps_node_output)
-
-#             self.gate = None
-#             if use_activation:
-#                 if irreps_gated.num_irreps == 0:
-#                     gate = Activation(self.irreps_node_output, acts=[torch.nn.SiLU()])
-#                 else:
-#                     gate = Gate(
-#                         irreps_scalars,
-#                         [torch.nn.SiLU() for _, ir in irreps_scalars],  # scalar
-#                         irreps_gates,
-#                         [torch.sigmoid for _, ir in irreps_gates],  # gates (scalars)
-#                         irreps_gated,  # gated tensors
-#                     )
-#                 self.gate = gate
-
-#     def forward(self, irreps_x, irreps_y, xy_scalar_fea, batch=None,eqv2=False, **kwargs):
-#         """
-#         x: [..., irreps]
-
-#         irreps_in = o3.Irreps("256x0e+64x1e+32x2e")
-#         sep_tp = SeparableFCTP(irreps_in,"1x1e",irreps_in,fc_neurons=None,
-#                             use_activation=False,norm_layer=None,
-#                             internal_weights=True)
-#         out = sep_tp(irreps_in.randn(100,10,-1),torch.randn(100,10,3),None)
-#         print(out.shape)
-#         """
-#         if eqv2==True:
-#             shape = irreps_x.shape[:-2]
-#             N = irreps_x.shape[:-2].numel()
-#             irreps_x = self.from_eqv2toe3nn(irreps_x)
-#             irreps_y = irreps_y.reshape(N, -1)
-
-#             out = self.dtp(irreps_x, irreps_y, None)
-#             if self.dtp_rad is not None and xy_scalar_fea is not None:
-#                 xy_scalar_fea = xy_scalar_fea.reshape(N, -1)
-#                 weight = self.dtp_rad(xy_scalar_fea)
-#                 temp = []
-#                 start = 0
-#                 start_scalar = 0
-#                 for mul,(ir,_) in self.dtp.tp.irreps_out.simplify():
-#                     temp.append((out[:,start:start+(2*ir+1)*mul].reshape(-1,mul,2*ir+1)*\
-#                                                 weight[:,start_scalar:start_scalar+mul].unsqueeze(-1)).reshape(-1,(2*ir+1)*mul))
-#                     start_scalar += mul
-#                     start += (2*ir+1)*mul
-#                 out = torch.cat(temp,dim = -1)
-#             out = self.lin(out)
-#             if self.norm is not None:
-#                 out = self.norm(out, batch=batch)
-#             if self.gate is not None:
-#                 out = self.gate(out)
-#             return self.from_e3nntoeqv2(out)
-#         else:
-#             shape = irreps_x.shape[:-1]
-#             N = irreps_x.shape[:-1].numel()
-#             irreps_x = irreps_x.reshape(N, -1)
-#             irreps_y = irreps_y.reshape(N, -1)
-
-#             weight = None
-#             if self.dtp_rad is not None and xy_scalar_fea is not None:
-#                 xy_scalar_fea = xy_scalar_fea.reshape(N, -1)
-#                 weight = self.dtp_rad(xy_scalar_fea)
-#             out = self.dtp(irreps_x, irreps_y, weight)
-#             out = self.lin(out)
-#             if self.norm is not None:
-#                 out = self.norm(out, batch=batch)
-#             if self.gate is not None:
-#                 out = self.gate(out)
-#             return out.reshape(list(shape) + [-1])
-
-
-#     def from_eqv2toe3nn(self,embedding):
-#         BL = embedding.shape[0]
-#         lmax = self.irreps_node_input[-1][1][0]
-#         start = 0
-#         out = []
-#         for l in range(1+lmax):
-#             out.append(embedding[:,start:start+2*l+1,:].permute(0,2,1).reshape(BL,-1))
-#             start += 2*l+1
-#         return torch.cat(out,dim = -1)
-
-
-#     def from_e3nntoeqv2(self,embedding):
-#         lmax = self.irreps_node_output[-1][1][0]
-#         mul = self.irreps_node_output[-1][0]
-
-#         start = 0
-#         out = []
-#         for l in range(1+lmax):
-#             out.append(embedding[:,start:start+mul*(2*l+1)].reshape(-1,mul,2*l+1).permute(0,2,1))
-#             start += mul*(2*l+1)
-#         return torch.cat(out,dim = 1)
 
 
 class CosineCutoff(torch.nn.Module):
@@ -3458,10 +2809,10 @@ class S2Activation(torch.nn.Module):
         self.act = torch.nn.SiLU()
 
     def forward(self, inputs, SO3_grid):
-        to_grid_mat = SO3_grid[self.lmax][self.mmax].get_to_grid_mat(
+        to_grid_mat = SO3_grid.get_to_grid_mat(
             device=None
         )  # `device` is not used
-        from_grid_mat = SO3_grid[self.lmax][self.mmax].get_from_grid_mat(device=None)
+        from_grid_mat = SO3_grid.get_from_grid_mat(device=None)
         x_grid = torch.einsum("bai, zic -> zbac", to_grid_mat, inputs)
         x_grid = self.act(x_grid)
         outputs = torch.einsum("bai, zbac -> zic", from_grid_mat, x_grid)
@@ -3604,184 +2955,6 @@ class FeedForwardNetwork_escn(torch.nn.Module):
         return node_irreps.reshape(out_shape + (-1, self.output_channels))
 
 
-class FeedForwardNetwork_s2(torch.nn.Module):
-    """
-    FeedForwardNetwork: Perform feedforward network with S2 activation or gate activation
-
-    Args:
-        sphere_channels (int):      Number of spherical channels
-        hidden_channels (int):      Number of hidden channels used during feedforward network
-        output_channels (int):      Number of output channels
-
-        lmax_list (list:int):       List of degrees (l) for each resolution
-        mmax_list (list:int):       List of orders (m) for each resolution
-
-        SO3_grid (SO3_grid):        Class used to convert from grid the spherical harmonic representations
-
-        activation (str):           Type of activation function
-        use_gate_act (bool):        If `True`, use gate activation. Otherwise, use S2 activation
-        use_grid_mlp (bool):        If `True`, use projecting to grids and performing MLPs.
-        use_sep_s2_act (bool):      If `True`, use separable grid MLP when `use_grid_mlp` is True.
-    """
-
-    def __init__(
-        self,
-        sphere_channels,
-        hidden_channels,
-        output_channels,
-        lmax,
-        mmax=2,
-        grid_resolution=18,
-        use_gate_act=False,  # [True, False] Switch between gate activation and S2 activation
-        use_grid_mlp=True,  # [False, True] If `True`, use projecting to grids and performing MLPs for FFNs.
-        use_sep_s2_act=True,  # Separable S2 activation. Used for ablation study.
-        # activation="scaled_silu",
-        # use_sep_s2_act=True,
-    ):
-        super(FeedForwardNetwork_s2, self).__init__()
-        self.sphere_channels = sphere_channels
-        self.hidden_channels = hidden_channels
-        self.output_channels = output_channels
-        self.sphere_channels_all = self.sphere_channels
-        self.so3_grid = torch.nn.ModuleList()
-        self.lmax = lmax
-        self.max_lmax = self.lmax
-        self.lmax_list = [lmax]
-        for l in range(lmax + 1):
-            SO3_m_grid = nn.ModuleList()
-            for m in range(lmax + 1):
-                SO3_m_grid.append(
-                    SO3_Grid(
-                        l, m, resolution=grid_resolution  # , normalization="component"
-                    )
-                )
-            self.so3_grid.append(SO3_m_grid)
-
-        self.use_gate_act = use_gate_act  # [True, False] Switch between gate activation and S2 activation
-        self.use_grid_mlp = use_grid_mlp  # [False, True] If `True`, use projecting to grids and performing MLPs for FFNs.
-        self.use_sep_s2_act = (
-            use_sep_s2_act  # Separable S2 activation. Used for ablation study.
-        )
-
-        self.so3_linear_1 = SO3_LinearV2(
-            self.sphere_channels_all, self.hidden_channels, lmax=self.lmax
-        )
-        if self.use_grid_mlp:
-            if self.use_sep_s2_act:
-                self.scalar_mlp = nn.Sequential(
-                    nn.Linear(
-                        self.sphere_channels_all,
-                        self.hidden_channels,
-                        bias=True,
-                    ),
-                    nn.SiLU(),
-                )
-            else:
-                self.scalar_mlp = None
-            self.grid_mlp = nn.Sequential(
-                nn.Linear(self.hidden_channels, self.hidden_channels, bias=False),
-                nn.SiLU(),
-                nn.Linear(self.hidden_channels, self.hidden_channels, bias=False),
-                nn.SiLU(),
-                nn.Linear(self.hidden_channels, self.hidden_channels, bias=False),
-            )
-        else:
-            if self.use_gate_act:
-                self.gating_linear = torch.nn.Linear(
-                    self.sphere_channels_all,
-                    self.lmax * self.hidden_channels,
-                )
-                self.gate_act = GateActivation(
-                    self.lmax, self.lmax, self.hidden_channels
-                )
-            else:
-                if self.use_sep_s2_act:
-                    self.gating_linear = torch.nn.Linear(
-                        self.sphere_channels_all, self.hidden_channels
-                    )
-                    self.s2_act = SeparableS2Activation(self.lmax, self.lmax)
-                else:
-                    self.gating_linear = None
-                    self.s2_act = S2Activation(self.lmax, self.lmax)
-        self.so3_linear_2 = SO3_LinearV2(
-            self.hidden_channels, self.output_channels, lmax=self.lmax
-        )
-
-    def forward(self, input_embedding):
-        out_shape = input_embedding.shape[:-2]
-
-        input_embedding = input_embedding.reshape(
-            out_shape.numel(), (self.lmax + 1) ** 2, self.sphere_channels
-        )
-        #######################for memory saving
-        x = SO3_Embedding(
-            input_embedding.shape[0],
-            self.lmax_list,
-            self.sphere_channels,
-            input_embedding.device,
-            input_embedding.dtype,
-        )
-        x.embedding = input_embedding
-        x = self._forward(x)
-
-        return x.embedding.reshape(out_shape + (-1, self.output_channels))
-
-    def _forward(self, input_embedding):
-        gating_scalars = None
-        if self.use_grid_mlp:
-            if self.use_sep_s2_act:
-                gating_scalars = self.scalar_mlp(
-                    input_embedding.embedding.narrow(1, 0, 1)
-                )
-        else:
-            if self.gating_linear is not None:
-                gating_scalars = self.gating_linear(
-                    input_embedding.embedding.narrow(1, 0, 1)
-                )
-
-        input_embedding = self.so3_linear_1(input_embedding)
-
-        if self.use_grid_mlp:
-            # Project to grid
-            input_embedding_grid = input_embedding.to_grid(
-                self.so3_grid, lmax=self.max_lmax
-            )
-            # Perform point-wise operations
-            input_embedding_grid = self.grid_mlp(input_embedding_grid)
-            # Project back to spherical harmonic coefficients
-            input_embedding._from_grid(
-                input_embedding_grid, self.so3_grid, lmax=self.max_lmax
-            )
-
-            if self.use_sep_s2_act:
-                input_embedding.embedding = torch.cat(
-                    (
-                        gating_scalars,
-                        input_embedding.embedding.narrow(
-                            1, 1, input_embedding.embedding.shape[1] - 1
-                        ),
-                    ),
-                    dim=1,
-                )
-        else:
-            if self.use_gate_act:
-                input_embedding.embedding = self.gate_act(
-                    gating_scalars, input_embedding.embedding
-                )
-            else:
-                if self.use_sep_s2_act:
-                    input_embedding.embedding = self.s2_act(
-                        gating_scalars,
-                        input_embedding.embedding,
-                        self.so3_grid,
-                    )
-                else:
-                    input_embedding.embedding = self.s2_act(
-                        input_embedding.embedding, self.so3_grid
-                    )
-
-        return self.so3_linear_2(input_embedding)
-
 
 def fibonacci_sphere(samples=100):
     """
@@ -3886,7 +3059,7 @@ class Electron_Density_Descriptor(torch.nn.Module):
             fibonacci_sphere(num_sphere_points), requires_grad=False
         )
 
-        print(self.gama.shape, self.sphere_grid.shape)  # Output: (100, 3)
+        logger.debug("gama shape={} sphere_grid shape={}", self.gama.shape, self.sphere_grid.shape)
         theta, phi = cartesian_to_spherical(self.sphere_grid)
         self.Y_lm_conj = []
         for l in range(lmax + 1):
@@ -3940,3 +3113,130 @@ class Electron_Density_Descriptor(torch.nn.Module):
         return projection.reshape(
             output_shape + ((self.lmax + 1) ** 2, self.output_channel)
         )
+
+
+
+def construct_radius_neighbor(node_pos,node_mask,
+                              expand_node_pos,expand_node_mask,
+                              max_dist,
+                              include_mask = None,
+                              min_dist = -1,
+                              max_neighbors = None,
+                              error_check = False,
+                              poly = "poly",
+                              toy_config = None,
+                              ):
+    '''
+    node_pos: B*L1*3
+    node_mask: B*L1  1 means nodes, 0 means padding
+    expand_node_pos: B*L2*3
+    expand_node_mask: B*L2  1 means nodes, 0 means padding
+    radius: float
+    outcell_index: B*L2  ranged from [0,L1), 
+    max_neighbors: int
+    
+    poly: "poly" or "poly_bell"
+    
+    '''
+
+    B,L = node_pos.shape[:2]
+    L2  = expand_node_pos.shape[1]
+    
+    ptr = torch.cat(
+            [
+                torch.zeros(1,dtype = torch.int32,device=node_pos.device),
+                torch.cumsum(torch.sum(node_mask, dim=-1), dim=-1),
+            ],
+            dim=0,
+        )
+    expand_ptr = torch.cat(
+            [
+                torch.zeros(1,dtype = torch.int32,device=node_pos.device),
+                torch.cumsum(torch.sum(expand_node_mask, dim=-1), dim=-1),
+            ],
+            dim=0,
+        )
+    
+    
+    edge_vec = node_pos.unsqueeze(2) - expand_node_pos.unsqueeze(1)
+    dist = torch.linalg.norm(
+                edge_vec, dim=-1, keepdim=False
+            )
+    # dist = torch.norm(edge_vec, dim=-1)  # B*L*L Attention: ego-connection is 0 here
+    dist = torch.where(dist >= min_dist,dist,max_dist+1000)
+    if include_mask is not None:
+        include_mask = include_mask.unsqueeze(1)
+        dist = torch.where(include_mask,dist,max_dist+1000)
+    neighbor_withincut = torch.max(torch.sum(dist <= max_dist,dim = -1)[node_mask])
+    _, neighbor_indices = dist.sort(dim=-1,descending=False)
+    if max_neighbors is not None:
+        topK = max(min(expand_node_pos.shape[1], max_neighbors,neighbor_withincut),1)
+    else:
+        topK = max(min(expand_node_pos.shape[1],neighbor_withincut),1)
+    # print("max_neighbors,neighbor_withincut",max_neighbors,neighbor_withincut,edge_vec.shape)
+    neighbor_indices = neighbor_indices[:, :, :topK]  # Shape: B*L*K
+    dist = torch.gather(dist, dim=-1, index=neighbor_indices)  # Shape: B*L*topK
+    f_dist = dist[node_mask]  # flattn_N* topK*
+
+    f_attn_mask = (f_dist > max_dist) .unsqueeze(dim=-1)
+    if poly == "poly":
+        f_poly_dist = polynomial(
+            f_dist, max_dist
+        )
+        f_poly_dist = torch.where(f_attn_mask.squeeze(dim=-1),0,f_poly_dist)
+    elif poly == "poly_bell":
+        f_poly_dist = smooth_polynomial_bell(f_dist,min_dist,max_dist,exponent=2)
+        f_poly_dist = torch.where(f_attn_mask.squeeze(dim=-1),0,f_poly_dist)
+    else: # poly_bell
+        raise ValueError("sorry, you must set poly or poly_bell")
+    # if outcell_index is None:
+    #     f_sparse_idx_node = (neighbor_indices + ptr[:B,None,None])[node_mask]
+    # else:
+    #     f_sparse_idx_node = (
+    #         torch.gather(
+    #             outcell_index.unsqueeze(1).repeat(1, L, 1), 2, neighbor_indice
+    #         )
+    #         + ptr[:B, None, None]
+    #     )[node_mask]
+    # f_sparse_idx_node = torch.clamp(f_sparse_idx_node, max=ptr[B] - 1)
+    f_sparse_idx_expnode = (neighbor_indices + expand_ptr[:B, None, None])[
+        node_mask
+    ]
+    f_sparse_idx_expnode = torch.clamp(f_sparse_idx_expnode, max=expand_ptr[B] - 1)
+    f_edge_vec = node_pos[node_mask].unsqueeze(dim=1) - expand_node_pos[expand_node_mask][f_sparse_idx_expnode]
+
+    if error_check:
+        f_attn_mask_tmp = f_attn_mask.squeeze(dim=-1)
+        a1 = torch.norm(f_edge_vec,dim = -1)[~f_attn_mask_tmp]-f_dist[~f_attn_mask_tmp]
+        if torch.max(a1)!=0:
+            logger.error("Please verify your code, neighbor selection error happened")
+        if torch.sum(node_pos[~node_mask]==0):
+            logger.warning("node padding part is zero, will lead to some neighbor dist sort error")
+        if torch.sum(expand_node_pos[~expand_node_mask]==0):
+            logger.warning("expand_node_pos padding part is zero, will lead to some neighbor dist sort error")
+    N, K = f_sparse_idx_expnode.shape
+    device = f_sparse_idx_expnode.device
+
+    if toy_config is not None:
+        f_attn_mask |= (torch.rand_like(f_attn_mask.float()) < toy_config.get("prob",0))
+
+    if f_attn_mask.dim() == 3: # f_attn_mask may be [N, K, 1]
+        valid_mask = ~f_attn_mask.squeeze(-1) # [N, K]
+    else:
+        valid_mask = ~f_attn_mask
+    
+
+    query_idx = torch.arange(N, device=device).unsqueeze(1).expand(N, K)[valid_mask].contiguous()
+    neighbor_idx = f_sparse_idx_expnode[valid_mask].contiguous()
+    
+
+    return {
+        "query_idx": query_idx,
+        "neighbor_idx": neighbor_idx,
+        "metadata": prepare_sparse_qk_edge_index_metadata(
+            query_idx,neighbor_idx,N,expand_ptr[B]
+        ),
+        "f_edge_vec": f_edge_vec[valid_mask].contiguous(),
+        "f_dist": f_dist[valid_mask].contiguous(),
+        "f_poly_dist": f_poly_dist[valid_mask].contiguous(),
+    }

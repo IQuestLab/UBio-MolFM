@@ -1,22 +1,9 @@
-encoder: "default" # or dit
-with_cluster: false
-use_rdkit: false
-# dit_config
+name: e2former
 encoder_embed_dim: 1024
 ffn_embedding_dim: 1536
 num_attention_heads: 32
 dropout: 0.1
 num_encoder_layers: 12
-
-
-# global_cfg:
-regress_forces: true
-direct_force: false
-use_padding: true
-use_fp16_backbone: false
-use_compile: false
-
-flatten_atoms_threshold: 1000
 
 pbc_expanded_token_cutoff: 256
 pbc_expanded_num_cell_per_direction: 4
@@ -24,30 +11,20 @@ pbc_expanded_num_cell_per_direction: 4
 
 
 # backbone_config:
-max_neighbors: 20
-irreps_node_embedding: "128x0e+128x1e+128x2e"
-num_layers: 8
-pbc_max_radius: 12.0
-max_radius: 15.0
-basis_type: "gaussian"
-number_of_basis: 128
-num_attn_heads: 4
-attn_scalar_head: 32
-irreps_head: "32x0e+32x1e+32x2e"
-rescale_degree: False
-nonlinear_message: False
-norm_layer: "rms_norm_sh_BL"
-alpha_drop: 0.1
-proj_drop: 0.0
-out_drop: 0.0
-drop_path_rate: 0.1
-attn_type: "first-order"
-tp_type : 'QK_alpha'
-edge_embedtype: "eqv2"
-attn_biastype: "share"
-ffn_type: 'eqv2ffn'
-add_rope: False
-time_embed: False
-sparse_attn: False
-dynamic_sparse_attn_threthod: 1000
-force_head: null
+num_layers: 4
+irreps_node_embedding: "256x0e+256x1e+256x2e"
+irreps_head: "2x0e+2x1e+2x2e"
+attn_scalar_head: 8
+num_attn_heads: 128
+number_of_basis: 256
+max_radius: 4.5
+max_neighbors: 32
+alpha_drop: 0
+basis_type: 'gaussiansmear'
+norm_layer: 'rms_norm_sh'
+attn_type: 'so2-first-order'
+tp_type: 'QK_alpha+triton'
+edge_embedtype: 'default'
+ffn_type: 's3'
+encoder: "default" # or dit
+with_cluster: false

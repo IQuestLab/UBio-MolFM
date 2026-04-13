@@ -1,41 +1,88 @@
 # -*- coding: utf-8 -*-
-import numpy as np
-import pyximport
+from functools import lru_cache
 
-pyximport.install(setup_args={"include_dirs": np.get_include()})
+import numpy as np
+
 import bisect
 import glob
-import math
+import os
 import pickle as pkl
 import random
-from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from typing import Optional
+
+from typing import Any, List, Optional, Union
 
 import lmdb
-import numpy as np
 import torch
-import torch.distributed as dist
+from ase.io import read as ase_read
+import ase
+import ase.db
+
+from numpy import dot
+from numpy.linalg import norm
+from rdkit import Chem
+from sympy.utilities.iterables import multiset_permutations
 from torch.utils.data import Subset
 from torch_cluster import radius_graph
+from torch_geometric.data import Data
+from tqdm import tqdm
 
-from molfm.data.collator import pack_batch
-from molfm.data.utils import dataset_profile
-from molfm.logging import logger
-from molfm.models.molfm_config import MOLFMConfig
+from abc import ABC, abstractmethod
 
-@dataclass
-class SampleRecord:
-    pass
 
-@dataclass
-class SampleBatch(SampleRecord):
-    batch_size: int
+from molfm.data.utils import (
+    get_data_defult_config,
+)
+
+_PT = Chem.GetPeriodicTable()
+
+def replace_func(*args,**kwargs):
+    return args,kwargs
+
+def from_ase(atomrow,target_dtype = torch.float32):
+    input_atoms = atomrow.toatoms()
+    input_atoms.info.update(atomrow.data)
+    calc = input_atoms.calc
+    atoms = input_atoms.copy()
+    atomic_numbers = np.array(atoms.get_atomic_numbers(), copy=True)
+    pos = np.array(atoms.get_positions(), copy=True)
+    pbc = np.array(atoms.pbc, copy=True)
+    cell = np.array(atoms.get_cell(complete=True), copy=True)
+
+    atomic_numbers = torch.from_numpy(atomic_numbers).long()
+    pos = torch.from_numpy(pos).to(target_dtype)
+    pbc = torch.from_numpy(pbc).bool().view(1, 3)
+    cell = torch.from_numpy(cell).to(target_dtype).view(1, 3, 3)
+    num_atoms = torch.tensor([pos.shape[0]], dtype=torch.long)
+
+
+    tags = torch.from_numpy(atoms.get_tags()).long()
+
+
+    # TODO another way to specify this is to spcify a key. maybe total_charge
+    charge = torch.LongTensor([atoms.info.get("charge", 0)])
+    multiplicity = torch.LongTensor([atoms.info.get("spin", 1)])
+    energy = input_atoms.calc.results["energy"] # use the default data type.
+    forces = torch.from_numpy(input_atoms.calc.results["forces"]).to(target_dtype)
+    
+    return Data(
+        pos=pos,
+        atomic_numbers=atomic_numbers,     # atomic numbers
+        num_atoms=num_atoms,        # number of atoms
+        cell=cell,
+        pbc=pbc,
+        charge=charge,
+        multiplicity=multiplicity,
+        energy=energy,
+        forces=forces,
+        tags=tags,
+    )
+
 
 class MoleculeLMDBDataset(ABC):
-
     r"""Dataset class to load from LMDB files containing relaxation
     trajectories or single point computations.
+    Useful for Structure to Energy & Force (S2EF), Initial State to·
+    Relaxed State (IS2RS), and Initial State to Relaxed Energy (IS2RE) tasks.
     Args:
             @path: the path to store the data
             @task: the task for the lmdb dataset
@@ -45,26 +92,13 @@ class MoleculeLMDBDataset(ABC):
 
     energy = "energy"
     forces = "forces"
-    _CELL_CORNER_MATRIX = torch.tensor(
-        [
-            [0.0, 0.0, 0.0],
-            [0.0, 0.0, 1.0],
-            [0.0, 1.0, 0.0],
-            [0.0, 1.0, 1.0],
-            [1.0, 0.0, 0.0],
-            [1.0, 0.0, 1.0],
-            [1.0, 1.0, 0.0],
-            [1.0, 1.0, 1.0],
-        ],
-        dtype=torch.float32,
-    )
 
     def __init__(
         self,
-        args: MOLFMConfig,
         path,
-        data_name="deshaw_di_mol",
+        data_name="default",
         remove_atomref_energy=True,
+        ## 1 kcal/mol = 0.0433634 eV, transform to eV by default here
     ):
         super(MoleculeLMDBDataset, self).__init__()
 
@@ -79,303 +113,204 @@ class MoleculeLMDBDataset(ABC):
             self.has_forces,
             self.pbc,
             self.unit,
-            others,
-        ) = dataset_profile(data_name)
+            (self.energy_std,self.force_std),
+        ) = get_data_defult_config(data_name)
         self.is_pbc = sum(self.pbc) > 0
         self.pbc = torch.Tensor(self.pbc).bool()
-        db_paths = self._collect_lmdb_paths(path)
+        db_paths = []
+        if isinstance(path, str):
+            path = [path]
+
+
+        for p in path:
+            if p.endswith("lmdb"):
+                db_paths.append(p)
+            else:
+                for dirpath, dirnames, filenames in os.walk(p):
+                    # if filenames!=[]:
+                    for f in filenames:
+                        if f.endswith("lmdb"):
+                            file_path = os.path.join(dirpath, f)
+                            db_paths.append(file_path)
+                            # db_paths.extend(glob.glob(p + "/*lmdb"))
+        # print(db_paths)
         assert len(db_paths) > 0, "No LMDBs found"
         self._keys, self.envs = [], []
+        self.atom_cnts = []
         self.db_paths = sorted(db_paths)
         self.open_db()
         self.remove_atomref_energy = remove_atomref_energy
-        self.args = args
+        self.conv, self.orbitals_ref, self.mask, self.chemical_symbols = (
+            None,
+            None,
+            None,
+            None,
+        )
 
-    def _collect_lmdb_paths(self, path):
-        db_paths = []
-        if isinstance(path, str):
-            db_paths.extend(self._expand_path(path))
-        elif isinstance(path, list):
-            for p in path:
-                db_paths.extend(self._expand_path(p))
-        return db_paths
-
-    @staticmethod
-    def _expand_path(path):
-        if path.endswith("lmdb"):
-            return [path]
-        return glob.glob(path + "/*.lmdb")
 
     def open_db(self):
+        self.file_type = []
         for db_path in self.db_paths:
-            self.envs.append(self.connect_db(db_path))
-            length = self.envs[-1].begin().get("length".encode("ascii"))
-            if length is not None:
-                length = pkl.loads(length)
-            else:
-                length = self.envs[-1].stat()["entries"]
-
-            self._keys.append(list(range(length)))
+            
+            if db_path.endswith("aselmdb"):
+                self.file_type.append(0)
+                env = ase.db.connect(str(db_path),readonly=True)
+                self.envs.append(env)
+                self._keys.append(env.ids)
+                with env._get_txn(write=False) as txn:
+                    atom_cnts = txn.get("atom_cnts".encode("ascii"))
+                    if atom_cnts is not None:
+                        self.atom_cnts.append( np.array(
+                            pkl.loads(atom_cnts),dtype=np.int32
+                            ))
+            elif db_path.endswith("lmdb"):
+                self.file_type.append(1)
+                env = lmdb.open(
+                    str(db_path),
+                    subdir=False,
+                    readonly=True,
+                    lock=False,
+                    readahead=False,
+                    meminit=False,
+                    max_readers=32,
+                )
+                self.envs.append(env)
+                length = self.envs[-1].begin().get("length".encode("ascii"))
+                if length is not None:
+                    length = pkl.loads(length)
+                else:
+                    length = self.envs[-1].stat()["entries"]
+                atom_cnts = self.envs[-1].begin().get("atom_cnts".encode("ascii"))
+                if atom_cnts is not None:
+                    self.atom_cnts.append(pkl.loads(atom_cnts))
+                self._keys.append(list(range(length)))
 
         keylens = [len(k) for k in self._keys]
         self._keylen_cumulative = np.cumsum(keylens).tolist()
+        if self.atom_cnts != []:
+            self.atom_cnts = np.concatenate(self.atom_cnts,axis = 0)
+        else:
+            self.atom_cnts = np.zeros(0)
         self.num_samples = sum(keylens)
 
     def __len__(self):
         return self.num_samples
 
     def __getitem__(self, idx):
-        db_idx, el_idx = self._resolve_db_index(idx)
-        data_object = self._load_data_object(db_idx, el_idx)
-        data_object.id = el_idx
+        # idx = 3558617 
+        db_idx = bisect.bisect(self._keylen_cumulative, idx)
+        # Extract index of element within that db.
+        el_idx = idx
+        if db_idx != 0:
+            el_idx = idx - self._keylen_cumulative[db_idx - 1]
+        assert el_idx >= 0
 
-        energy = self._extract_energy(data_object)
+        # Return features.
+        if self.file_type[db_idx] == 0: # aselmdb
+            atomrow = self.envs[db_idx]._get_row(self._keys[db_idx][el_idx])
+            data_object = from_ase(atomrow)
+        else:
+            datapoint_pickled = (
+                self.envs[db_idx]
+                .begin()
+                .get(f"{self._keys[db_idx][el_idx]}".encode("ascii"))
+            )
+            data_object = pkl.loads(datapoint_pickled)
+        
+        data_object.id = el_idx  # f"{db_idx}_{el_idx}"
+
+        if "energy" not in data_object:
+            energy = data_object.y
+        else:
+            energy = data_object.energy
+        if "force" in data_object:
+            data_object["forces"] = data_object.force
         if self.remove_atomref_energy:
-            energy = self._remove_atom_reference(energy, data_object.atomic_numbers)
+            unique, counts = np.unique(
+                data_object.atomic_numbers.int().numpy(), return_counts=True
+            )
+            # atom_hist[unique] = counts
+            energy = energy - np.sum(self.atom_reference[unique] * counts)
+            energy = torch.Tensor([energy - self.system_ref])
         energy = torch.Tensor([energy]).reshape(-1)
 
-        out = self._build_base_output(idx, data_object, energy)
-        if self.is_pbc:
-            out = self._apply_pbc(data_object, out)
-        else:
-            out = self._apply_non_pbc(out, energy)
-        out = self._cast_float_fields(out)
-        out = self.build_2d_graph(out)
-        return out
-
-    def _resolve_db_index(self, idx):
-        db_idx = bisect.bisect(self._keylen_cumulative, idx)
-        el_idx = idx if db_idx == 0 else idx - self._keylen_cumulative[db_idx - 1]
-        assert el_idx >= 0
-        return db_idx, el_idx
-
-    def _load_data_object(self, db_idx, el_idx):
-        datapoint_pickled = (
-            self.envs[db_idx]
-            .begin()
-            .get(f"{self._keys[db_idx][el_idx]}".encode("ascii"))
-        )
-        from fairchem.core.common.utils import pyg2_data_transform
-
-        return pyg2_data_transform(pkl.loads(datapoint_pickled))
-
-    @staticmethod
-    def _extract_energy(data_object):
-        if "energy" not in data_object:
-            return data_object.y
-        return data_object.energy
-
-    def _remove_atom_reference(self, energy, atomic_numbers):
-        unique, counts = np.unique(atomic_numbers.int().numpy(), return_counts=True)
-        energy = energy - np.sum(self.atom_reference[unique] * counts)
-        return torch.Tensor([energy - self.system_ref])
-
-    def _build_base_output(self, idx, data_object, energy):
-        mapped_charge = self._map_charge(data_object)
-        cluster_ids = self._map_cluster_ids(data_object)
-        return {
-            "sample_type": 0,
-            "coords": data_object.pos,
-            "forces": data_object.force * self.unit
-            if "force" in data_object
-            else data_object.forces * self.unit,
-            "num_atoms": data_object.pos.shape[0],
-            "token_type": data_object.atomic_numbers.int().reshape(-1),
-            "idx": idx,
-            "energy": energy.reshape(-1) * self.unit,
-            "has_energy": torch.tensor([self.has_energy], dtype=torch.bool),
-            "has_forces": torch.tensor([self.has_forces], dtype=torch.bool),
-            "data_name": self.data_name,
-            "charge": mapped_charge.reshape(-1),
-            "cluster_ids": cluster_ids.reshape(-1),
-            "cluster_centers": data_object.cluster_centers
-            if "cluster_centers" in data_object
-            else torch.tensor([0], dtype=torch.int).unsqueeze(-1),
-        }
-
-    @staticmethod
-    def _map_charge(data_object):
         if "charge" in data_object.keys():
-            return (data_object.charge + 5).int()
-        return torch.tensor([0], dtype=torch.int)
+            charge = data_object.charge.int()
+        else:
+            charge = torch.tensor([0], dtype=torch.int)
 
-    @staticmethod
-    def _map_cluster_ids(data_object):
-        if "cluster_ids" in data_object.keys():
-            return data_object.cluster_ids.int()
-        return torch.tensor([0], dtype=torch.int)
-
-    def _apply_pbc(self, data_object, out):
-        out["token_type"] = torch.cat(
-            [out["token_type"], torch.full([8], 128)], dim=-1
-        )
-        cell_corner_pos = torch.matmul(
-            self._CELL_CORNER_MATRIX, data_object.cell.squeeze(dim=0).float()
-        )
-        out["coords"] = torch.cat([out["coords"], cell_corner_pos], dim=0)
-        out["forces"] = torch.cat(
-            [
-                torch.tensor(out["forces"].clone().detach(), dtype=torch.float32),
-                torch.zeros([8, 3], dtype=torch.float32),
-            ],
-            dim=0,
-        )
-        out["cell"] = data_object.cell.squeeze(dim=0)
-        out["pbc"] = self.pbc
-        out["stress"] = torch.zeros((3, 3), dtype=torch.float32, device=out["energy"].device)
-        if hasattr(data_object, "cell_offsets"):
-            out["cell_offsets"] = torch.tensor(data_object.cell_offsets.numpy())
-        out["energy_per_atom"] = out["energy"] / out["num_atoms"]
-        return out
-
-    def _apply_non_pbc(self, out, energy):
-        out["cell"] = torch.zeros((3, 3), dtype=torch.float32)
-        out["pbc"] = torch.zeros(3, dtype=torch.float32).bool()
-        out["stress"] = torch.zeros((3, 3), dtype=torch.float32, device=energy.device)
-        out["energy_per_atom"] = out["energy"] / out["num_atoms"]
-        return out
-
-    @staticmethod
-    def _cast_float_fields(out):
-        float_exclude = {
-            "num_atoms",
-            "token_type",
-            "idx",
-            "edge_index",
-            "has_energy",
-            "has_forces",
-            "sample_type",
-            "data_name",
+        if "multiplicity" in data_object.keys():
+            multiplicity = data_object.multiplicity.int()
+        else:
+            multiplicity = torch.tensor([1], dtype=torch.int)
+        
+        natoms = data_object.pos.shape[0]
+        if "fixed" in data_object.keys():
+            fixed = data_object["fixed"]
+        else:
+            fixed = torch.zeros(natoms, dtype=torch.int)
+        
+        if "cos" in data_object.keys():
+            cos = data_object["cos"]
+        else:
+            cos = torch.ones(natoms)
+        
+        data_object.pos = data_object.pos - torch.mean(data_object.pos,dim=0,keepdim=True)
+        out = {
+            "pbc": self.pbc,
+            "cos":cos,
+            "idx": idx,
+            "pos": data_object.pos,
+            "forces": data_object.forces * self.unit,
+            "num_atoms": torch.tensor([natoms],dtype=torch.int),
+            "atomic_numbers": data_object.atomic_numbers.int().reshape(-1),
+            "energy": energy.reshape(-1) * self.unit,  # this is used from model training, mean/ref is removed.
+            "energy_per_atom":energy.reshape(-1) * self.unit / data_object.pos.shape[0],
+            "fixed":fixed,
+            "data_name": self.data_name,
+            "charge": charge.reshape(-1),
+            "multiplicity": multiplicity.reshape(-1),
         }
-        for key in list(out.keys()):
-            if key not in float_exclude:
+
+        if self.is_pbc:
+            out.update({"cell": data_object.cell.reshape(3,3)})
+        else:
+            out["cell"] = torch.zeros((3, 3), dtype=torch.float32)
+
+        for key in out.keys():
+            if key not in [
+                "num_atoms",
+                "atomic_numbers",
+                "idx",
+                "edge_index",
+                "has_energy",
+                "has_forces",
+                "has_stress",
+                "sample_type",
+                "data_name",
+                "charge",
+                "multiplicity",
+                "data_src"
+            ]:
                 out[key] = out[key].clone().detach().float()
+
         return out
 
-    def build_empty_graph(self, data):
-        N = data["num_atoms"]
 
-        # Initialize adj as a zero matrix of the correct shape
-        adj = torch.zeros([N, N], dtype=torch.bool)
-
-        # Initialize edge_index and edge_attr as zero matrices
-        data["edge_index"] = torch.zeros(
-            (2, 0), dtype=torch.long
-        )  # Empty edge index with correct shape
-        data["edge_attr"] = torch.zeros(
-            (0, 1), dtype=torch.long
-        )  # Empty edge attribute with correct shape
-
-        # Initialize attn_edge_type as a zero tensor with correct shape
-        attn_edge_type = torch.zeros([N, N, 1], dtype=torch.long)
-
-        # Initialize adj as a zero matrix of the correct shape (already done)
-        adj = torch.zeros([N, N], dtype=torch.bool)
-
-        # Set the in-degree as a zero vector
-        indgree = torch.zeros(N, dtype=torch.long)
-
-        # Set node_attr as token_type reshaped to match the expected shape
-        data["node_attr"] = data["token_type"].reshape(-1, 1)
-
-        # Initialize attn_bias with zeros and shape (N+1, N+1)
-        data["attn_bias"] = torch.zeros([N + 1, N + 1], dtype=torch.float)
-
-        # Initialize in-degree to zero vector
-        data["in_degree"] = indgree
-
-        # Initialize shortest_path_result, path, and edge_input with zeros
-        spatial_pos = torch.zeros([N, N], dtype=torch.long)
-        data["edge_input"] = torch.zeros([N, N, 1], dtype=torch.long)
-        data["spatial_pos"] = spatial_pos
-
-        return data
-
-    def build_2d_graph(self, data):
-        N = data["num_atoms"]
-        adj = torch.zeros([N, N], dtype=torch.bool)
-        if "edge_index" not in data or data["edge_index"] is None:
-            data["edge_attr"] = None
-            edge_index = radius_graph(data["coords"][:N], 10)
-            data["edge_index"] = edge_index
-        edge_index = data["edge_index"].clone().detach().to(torch.long)
-        edge_attr = torch.ones((data["edge_index"].shape[1], 1), dtype=torch.long)
-        attn_edge_type = torch.zeros([N, N, edge_attr.size(-1)], dtype=torch.long)
-        attn_edge_type[edge_index[0, :], edge_index[1, :]] = edge_attr + 1
-        adj[edge_index[0, :], edge_index[1, :]] = True
-        indgree = adj.long().sum(dim=1).view(-1)
-
-        data["edge_index"] = edge_index
-        data["edge_attr"] = edge_attr
-        data["node_attr"] = data["token_type"].reshape(-1, 1)
-
-        data["attn_bias"] = torch.zeros([N + 1, N + 1], dtype=torch.float)
-        data["in_degree"] = indgree
-
-        return data
-
-    @classmethod
-    def build_graph_feature(cls, data):
-        N = data["num_atoms"]
-        adj = torch.zeros([N, N], dtype=torch.bool)
-
-        edge_index = torch.tensor(data["edge_index"].clone().detach(), dtype=torch.long)
-        edge_attr = torch.ones((data["edge_index"].shape[1], 1), dtype=torch.long)
-        attn_edge_type = torch.zeros([N, N, edge_attr.size(-1)], dtype=torch.long)
-        attn_edge_type[edge_index[0, :], edge_index[1, :]] = edge_attr + 1
-        adj[edge_index[0, :], edge_index[1, :]] = True
-        indgree = adj.long().sum(dim=1).view(-1)
-
-        data["edge_index"] = edge_index
-        data["edge_attr"] = edge_attr
-        data["node_attr"] = data["token_type"].reshape(-1, 1)
-
-        data["attn_bias"] = torch.zeros([N + 1, N + 1], dtype=torch.float)
-        data["in_degree"] = indgree
-
-        return data
-
-    def connect_db(self, lmdb_path=None):
-        env = lmdb.open(
-            str(lmdb_path),
-            subdir=False,
-            readonly=True,
-            lock=False,
-            readahead=False,
-            meminit=False,
-            max_readers=32,
-        )
-        return env
 
     def close_db(self):
         if not self.path.is_file():
             for env in self.envs:
-                env.close()
+                if hasattr(env, "close"):
+                    env.close()
             self.envs = []
         else:
-            self.env.close()
+            if hasattr(self.env, "close"):
+                self.env.close()
             self.env = None
 
-    def split_dataset(self, training_ratio=0.03, validation_ratio=0.2, sort=False):
-        num_samples = self.num_samples
-        # Shuffle the indices and split them into training and validation sets
-        indices = list(range(num_samples))
-        random.Random(12345).shuffle(indices)
-        assert (
-            training_ratio + validation_ratio <= 1.0
-        ), f"Invalid training_ratio '{training_ratio}' and validation_ratio '{validation_ratio}'"
-
-        num_validation_samples = int(num_samples * validation_ratio)
-        num_training_samples = int(num_samples * training_ratio)
-
-        training_indices = indices[:num_training_samples]
-        validation_indices = indices[-num_validation_samples:]
-
-        dataset_train = Subset(self, training_indices)
-        dataset_val = Subset(self, validation_indices)
-        return dataset_train, dataset_val
-
-    def split_train_valid_test(self, ratio_list: list, sort=False, shuffle=True):
+    
+    def split_train_valid_test(self, ratio_list: list, shuffle=True):
         num_samples = self.num_samples
 
         indices = list(range(num_samples))
@@ -391,224 +326,254 @@ class MoleculeLMDBDataset(ABC):
         validation_indices = indices[
             num_training_samples : num_training_samples + num_validation_samples
         ]
-        test_indices = indices[num_training_samples + num_validation_samples :]
-
+        test_indices = indices[num_training_samples + num_validation_samples - 1 :]
+        
         dataset_train = Subset(self, training_indices)
         dataset_val = Subset(self, validation_indices)
         dataset_test = Subset(self, test_indices)
+        if self.atom_cnts.any():
+            dataset_train.atom_cnts = self.atom_cnts[training_indices]
+            dataset_val.atom_cnts = self.atom_cnts[validation_indices]
+            dataset_test.atom_cnts = self.atom_cnts[test_indices]
+        else:
+            dataset_train.atom_cnts = self.atom_cnts
+            dataset_val.atom_cnts = self.atom_cnts
+            dataset_test.atom_cnts = self.atom_cnts
+
         return dataset_train, dataset_val, dataset_test
 
 
-class MultiDataset:
-    def __init__(
-        self,
-        args,
-        dataset_list,
-        len_data: Optional[int] = None,
-        extra_collate_fn=None,
-        **kwargs,
-    ):
-        self.args = args
-        self.dataset_list = dataset_list
-        self.num_datasets = len(dataset_list)
-        self.extra_collate_fn = extra_collate_fn
+class TOYxyzDataset():
+    def __init__(self, config=None, path = None,transform=None,system_size = 8000,cell_size = None,device = None,**args) -> None:
+        super().__init__()
+        if isinstance(system_size,int):
+            system_size = [system_size,]
 
-        self.dataset_lens = [len(ds) for ds in self.dataset_list]
-        self.dataset_ranges = np.cumsum([0] + self.dataset_lens).tolist()
-        self.total_len = int(self.dataset_ranges[-1])
+        self.system_size = system_size
 
-        if len_data is not None and int(len_data) != self.total_len:
-            raise ValueError(
-                f"len_data ({len_data}) must equal sum(len(ds)) ({self.total_len}) "
-                "for MultiDataset."
-            )
+        self.cell_size = None if cell_size is None else torch.Tensor(cell_size).cpu()
+        self.device = device
 
-        logger.info(f"Total data Length is {self.total_len/1000/1000:0.2f}M")
+    def __getitem__(self, idx):
 
-    def __len__(self) -> int:
-        return self.total_len
+        N = self.system_size[idx]
+        rho = 0.8
+        volume = N / rho
+        box_length = volume ** (1/3)
+        if self.cell_size is None:
+            # Generate N random 3D positions in the box
+            pos = torch.rand((N, 3))*box_length
+            pbc = torch.zeros(3)
+            cell = torch.zeros(1, 3, 3)
+        else:
+            pos = torch.rand((N, 3))@self.cell_size
+            pbc = torch.ones(3)
+            cell = self.cell_size.reshape(3,3)
+        atomic_numbers = torch.randint(1,50,(N,))
+        forces = torch.randn((N, 3))
+        energy = torch.randn(1)
+        
 
-    def __getitem__(self, idx: int):
-        if idx < 0 or idx >= self.total_len:
-            raise IndexError(f"Index {idx} out of range for dataset length {self.total_len}")
+        out = Data(
+            **{
+                "data_name":"toy",
+                "idx": idx,
 
-        for i in range(self.num_datasets):
-            start = self.dataset_ranges[i]
-            end = self.dataset_ranges[i + 1]
-            if start <= idx < end:
-                return self.dataset_list[i][idx - start]
+                
+                "atomic_numbers": atomic_numbers,
+                "pos": pos.float(),
+                "num_atoms": torch.tensor([N],dtype=torch.int),
 
-        raise RuntimeError(f"Data with index {idx} not found in any subset.")
+                "pbc":pbc,
+                "cell":cell,
+                "charge": torch.tensor([0], dtype=torch.int).reshape(-1),
+                "multiplicity": torch.tensor([1], dtype=torch.int).reshape(-1),
+                
+                "energy": energy.reshape(1).float(),
+                "energy_per_atom": energy.reshape(1).float()/N,
+                "forces": forces.float(),
 
-    def collate(self, samples):
-        batched_data = pack_batch(
-            samples,
+            }
         )
-        if self.extra_collate_fn is not None:
-            batched_data = self.extra_collate_fn(samples, batched_data)
-        return batched_data
+        for key in out.keys():
+            if isinstance(out[key],torch.Tensor):
+                out[key] = out[key].to(self.device)
+        return out
+    
+    def __len__(self,):
+        return len(self.system_size)
 
-    def num_tokens(self, idx: int) -> int:
-        raise NotImplementedError("num_tokens is not implemented for this dataset.")
+class SPICExyzDataset(torch.utils.data.Dataset):
+    def __init__(self, path,
+        data_name="spice",**kwargs) -> None:
+        super().__init__()
+        self.data_name = data_name
+        if path is None:
+            self.paths = []
+            assert (
+                len(self.paths) == 1
+            ), f"{type(self)} does not support a list of src paths."
+            self.path = self.paths[0]
 
+        else:
+            self.path = path
+        self.atoms_list = ase.io.read(self.path, index=":")
 
-class ProportionalSampler(ABC):
-    # samples data from different modalities
-    def __init__(
-        self,
-        dataset: MultiDataset,
-        dataset_split_ratios: str,
-        dataset_batch_sizes: str,
-        num_replicas: Optional[int] = None,
-        rank: Optional[int] = None,
-        seed: int = 0,
-    ) -> None:
-        self.dataset_split_ratios = [
-            float(ratio) for ratio in dataset_split_ratios.split(",")
-        ]
-        self.dataset_batch_sizes = [
-            int(batch_size) for batch_size in dataset_batch_sizes.split(",")
-        ]
-        assert len(dataset.dataset_lens) == len(self.dataset_split_ratios) and len(
-            dataset.dataset_lens
-        ) == len(
-            self.dataset_batch_sizes
-        ), "Dataset parameters mismatched, please check data_path_list, dataset_name_list, dataset_split_raito, and dataset_micro_batch_size"
-        self.dataset_ranges = np.cumsum([0] + dataset.dataset_lens)
-        total_len = self.dataset_ranges[-1]
-        dataset_sampled_lens = [
-            total_len * ratio for ratio in self.dataset_split_ratios
-        ]
-        weight_dict = {}
-        for i in range(len(self.dataset_ranges) - 1):
-            start = self.dataset_ranges[i]
-            end = self.dataset_ranges[i + 1]
-            weight_dict[(start, end)] = dataset_sampled_lens[i] * 1.0 / (end - start)
-
-        if num_replicas is None:
-            if not dist.is_available():
-                raise RuntimeError("Requires distributed package to be available")
-            num_replicas = dist.get_world_size()
-        if rank is None:
-            if not dist.is_available():
-                raise RuntimeError("Requires distributed package to be available")
-            rank = dist.get_rank()
-        if rank >= num_replicas or rank < 0:
-            raise ValueError(
-                "Invalid rank {}, rank should be in the interval"
-                " [0, {}]".format(rank, num_replicas - 1)
-            )
-        self.dataset = dataset
-        self.num_replicas = num_replicas
-        self.rank = rank
-        self.epoch = 0
-        self.weight_dict = weight_dict
-        self.dataset_sampled_len = {}
-
-        dataset_indices_len = 0
-        num_samples = 0
-        for i in range(len(self.dataset_ranges) - 1):
-            start = self.dataset_ranges[i]
-            end = self.dataset_ranges[i + 1]
-            ratio = weight_dict[(start, end)]
-            sampled_len = math.ceil((end - start) * ratio)
-            micro_batch_size = self.dataset_batch_sizes[i]
-            sampled_len = (
-                (sampled_len + micro_batch_size * num_replicas - 1)
-                // (micro_batch_size * num_replicas)
-                * micro_batch_size
-                * num_replicas
-            )
-            self.dataset_sampled_len[(start, end)] = sampled_len
-            dataset_indices_len += sampled_len
-            num_samples += sampled_len // num_replicas
-
-        self.dataset_indices_len = dataset_indices_len
-        self.num_total_samples = num_samples
-        self.num_samples = num_samples
-        self.total_size = self.num_samples * self.num_replicas
-        assert self.total_size == self.dataset_indices_len
-        self.seed = seed
-        self.shuffle = True
-        self.drop_last = False
-        self.num_skip_batches = None
-        self.micro_batch_size = None
-
-    def __iter__(self):
-        generator = np.random.default_rng(self.epoch + self.seed)
-        torch_generator = torch.Generator()
-        torch_generator.manual_seed(self.seed + self.epoch)
-        indices = []
-        for begin, end in np.sort(list(self.dataset_sampled_len.keys())):
-            sampled_len = self.dataset_sampled_len[(begin, end)]
-            indices_for_dataset = []
-            while sampled_len > end - begin:
-                indices_for_dataset.extend(
-                    torch.randperm(end - begin, generator=torch_generator).numpy()
-                    + begin
-                )
-                sampled_len -= end - begin
-            indices_for_dataset.extend(
-                list(generator.choice(end - begin, sampled_len, replace=False) + begin)
-            )
-            indices_for_dataset = list(
-                torch.tensor(indices_for_dataset, dtype=torch.long)[
-                    torch.randperm(len(indices_for_dataset), generator=torch_generator)
-                ].numpy()
-            )
-            indices.extend(
-                indices_for_dataset[self.rank : self.total_size : self.num_replicas]
-            )
-        sorted_indices = torch.randperm(
-            len(indices), generator=torch_generator
-        ).tolist()
-        indices = np.array(indices)[np.array(sorted_indices)].tolist()
-
-        assert len(indices) == self.num_total_samples
-        self.num_samples = self.num_total_samples
-
-        num_datasets = len(self.dataset_ranges) - 1
-        split_indices = [[] for _ in range(num_datasets)]
-        for index in indices:
-            for tag in range(num_datasets):
-                if (
-                    index >= self.dataset_ranges[tag]
-                    and index < self.dataset_ranges[tag + 1]
-                ):
-                    split_indices[tag].append(index)
-
-        batch_seqs = [
+        self.atom_reference = np.array(
             [
-                split_indices[j][
-                    i * self.dataset_batch_sizes[j] : i * self.dataset_batch_sizes[j]
-                    + self.dataset_batch_sizes[j]
-                ]
-                for i in range(len(split_indices[j]) // self.dataset_batch_sizes[j])
+                0.00000000e00,
+                -1.63841057e01,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                -1.03758911e03,
+                -1.49072485e03,
+                -2.04814404e03,
+                -2.71846191e03,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                -9.29155469e03,
+                -1.08369053e04,
+                -1.25243545e04,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                -7.00463750e04,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                -8.10290869e03,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
+                0.00000000e00,
             ]
-            for j in range(num_datasets)
-        ]
+        )
+        self.num_samples = len(self.atoms_list)
+        self.subset_name2id = {
+            "PubChem": torch.tensor([0],dtype = torch.int),  # 34093,
+            "DES370K Monomers": torch.tensor([1],dtype = torch.int),  # 889,
+            "DES370K Dimers": torch.tensor([2],dtype = torch.int),  # 13908,
+            "Dipeptides": torch.tensor([3],dtype = torch.int),  # 1025,
+            "Solvated Amino Acids": torch.tensor([4],dtype = torch.int),  # 52
+            "water": torch.tensor([5],dtype = torch.int),  # 84,
+            "QMugs": torch.tensor([6],dtype = torch.int),  # 144,
+        }
 
-        g = torch.Generator()
-        g.manual_seed(self.seed + self.epoch)
-        total_num_batches = np.sum([len(batch_seq) for batch_seq in batch_seqs])
-        all_batches = []
-        for batch_seq in batch_seqs:
-            all_batches += batch_seq
-        batch_indices = torch.randperm(total_num_batches, generator=g).tolist()
+    def __getitem__(self, idx):
+        atoms = self.atoms_list[idx]
+        energy = atoms.get_potential_energy()
+        forces = atoms.get_forces()
+        atomic_numbers = atoms.get_atomic_numbers()
+        pos = atoms.get_positions() + 0.1
+        subset_name = atoms.info["config_type"]
 
-        if self.num_skip_batches is not None:
-            batch_indices = batch_indices[self.num_skip_batches :]
-        all_batches = [all_batches[i] for i in batch_indices]
-        if self.num_skip_batches is not None:
-            self.num_samples = np.sum(len(batch) for batch in all_batches)
-        return iter(all_batches)
+        charge = atoms.info.get("charge",0)
+        if charge is None:
+            charge = float(np.sum(atoms.get_initial_charges()))
+        charge = int(round(charge))
 
+        multiplicity = atoms.info.get("spin",1)
+        
+        unique, counts = np.unique(atomic_numbers, return_counts=True)
+        energy = energy - np.sum(self.atom_reference[unique] * counts)
+        out = Data(
+            **{
+                "data_name":self.data_name,
+                "data_src": self.subset_name2id[subset_name],
+                "idx": idx,
+                "pos": torch.from_numpy(pos).float(),
+
+                "atomic_numbers": torch.from_numpy(atomic_numbers),
+                "num_atoms": torch.tensor([len(atomic_numbers)], dtype=torch.int),
+
+                "energy": torch.from_numpy(energy.reshape(1)).float(),
+                "energy_per_atom":torch.from_numpy(energy.reshape(1)).float() / len(atomic_numbers),
+                "forces": torch.from_numpy(forces).float(),
+
+                "fixed" : torch.zeros(len(atomic_numbers), dtype=torch.int),
+                "pbc": torch.zeros(3),
+                "cell": torch.zeros(1, 3, 3),
+                "charge": torch.tensor([charge], dtype=torch.int).reshape(-1),
+                "multiplicity": torch.tensor([multiplicity], dtype=torch.int).reshape(-1),
+            }
+        )
+        
+        return out
+    
     def __len__(self) -> int:
         return self.num_samples
-
-    def set_skip_batches(self, num_skip_batches, micro_batch_size):
-        self.num_skip_batches = num_skip_batches
-        self.micro_batch_size = micro_batch_size
-
-    def set_epoch(self, epoch: int) -> None:
-        self.epoch = epoch

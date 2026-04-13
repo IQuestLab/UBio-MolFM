@@ -1,0 +1,42 @@
+name: mfm
+channels:
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.12
+  - conda-forge::pytorch=2.7.0=cuda126_mkl_py312_h30b5a27_300
+  - conda-forge::torchvision=0.22.0=cuda126_py312_h4a51b5c_0
+  - conda-forge::torchaudio=2.7.0=cuda126_py312hc7816e8_1
+  - pip
+  - loguru
+  - numba
+  - peft
+  - python-lmdb
+  - tensorboard
+  - lmdb
+  - orjson
+  - submitit
+  - numpy
+  - scipy
+  - pip:
+      - --find-links https://data.pyg.org/whl/torch-2.7.0+cu126.html
+      - torch-geometric==2.5.3
+      - pyg_lib
+      - torch_scatter
+      - torch_sparse
+      - torch_cluster
+      - torch_spline_conv
+      # # others
+      - deepspeed
+
+      - triton
+      - hydra-core
+      - e3nn
+      - ase
+      - ase_db_backends
+      - rdkit
+      - wandb==0.21.0
+      - nequip-allegro==0.7.0
+      # - fairchem-core --no-deps
+      - pymatgen

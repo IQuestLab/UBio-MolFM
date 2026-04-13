@@ -1,60 +1,13 @@
 defaults:
 - config_molfm_schema
 - backbone_config: e2former
+- strategy_config: single
 - _self_
+- scheduler_config: groupWarmupDecayLR
 
-backbone: e2former
-local_rank:  -1
-world_size: 1
-node_rank: 0
-rank: 0
-pipeline_model_parallel_size: 0
-tensor_model_parallel_size: 1
-deepspeed_config: ""
-dist_backend: "nccl"
-seed: 46
-fp16: False
-auto_cast: False
-bf16: False
-grad_scaler_init: 1.0
-gradient_accumulation_steps: 1
-train_batch_size: 1
-val_batch_size: 1
-val_batch_interval: 0
-val_batch_log_interval: 1000
-val_epoch_interval: 1
-save_dir: "./checkpoints"
-save_batch_interval: 0
-save_epoch_interval: 1
-log_interval: 10000
-strategy: "DDP"
-cpu: False
-ifresume: False
-load_ckpt: False
-finetune_from_checkpoint_dir: null
-finetune_from_checkpoint_id: null
-ifstack: False
-gradient_clipping: 1.0
-total_num_steps: 1000
-warmup_num_steps: 60
-warmup_factor: 0.06
-warmup_lr: 1e-6
-warmup_num_epochs: 10
-max_lr: 0.0001
-init_lr: 8e-5
-min_lr: 8e-6
-weight_decay: 0.0
-total_num_epochs: 100
-wandb: False
-wandb_team: ""
-wandb_group: ""
-wandb_project: ""
-wandb_run_name: ""
-beta1: 0.9
-beta2: 0.999
-eps: 1e-8
 
-data_path: ""
-data_path_list: ""
-dataset_name_list: ""
-dataset_split_raito: ""
+# early stopping
+early_stopping: False
+early_stopping_patience: 10
+early_stopping_metric: "loss" # get loss after validation
+early_stopping_mode: "min"

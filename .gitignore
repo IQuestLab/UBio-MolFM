@@ -1,8 +1,6 @@
 __pycache__/
-outputs/
-.vscode/
-.history/
-wandb/
-swanlog/
-
-pretrain_config.yaml
+*.log
+*.whl
+*.png
+*.pyc
+.vscode
