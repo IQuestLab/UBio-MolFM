@@ -95,7 +95,8 @@ def swanlab_init(args,save_dir = "./"):
                 resume = "allow" if "id" in record else False,
                 id=record["id"] if "id" in record else None,
                 project=args.swanlab_project,     
-                workspace=args.swanlab_workspace,
+                # Empty/unset -> None, i.e. the account's own default workspace.
+                workspace=args.swanlab_workspace or None,
                 experiment_name=args.experiment_name,
                 
                 config=args

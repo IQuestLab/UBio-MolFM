@@ -90,7 +90,6 @@ torchrun $DISTRIBUTED_ARGS src/molfm/tasks/pretrain_smallmol.py \
           log_interval=100 \
           wandb=$wandb \
           swanlab=$swanlab \
-          swanlab_workspace=AlphaLab \
           swanlab_project=oc20 \
           tb=$tb \
           tb_dir=$tb_dir \
