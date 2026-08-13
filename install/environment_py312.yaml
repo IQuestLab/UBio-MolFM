@@ -1,3 +1,7 @@
+# Pinned to the environment UBio-MolFM V1 was developed and tested on:
+# Python 3.12 + PyTorch 2.8.0 / CUDA 12.8. The PyG extension wheels and
+# faiss-gpu are CUDA-build specific, so the torch and CUDA versions have to
+# move together with them.
 name: mfm
 channels:
   - conda-forge
@@ -5,9 +9,6 @@ channels:
 
 dependencies:
   - python=3.12
-  - conda-forge::pytorch=2.7.0=cuda126_mkl_py312_h30b5a27_300
-  - conda-forge::torchvision=0.22.0=cuda126_py312_h4a51b5c_0
-  - conda-forge::torchaudio=2.7.0=cuda126_py312hc7816e8_1
   - pip
   - loguru
   - numba
@@ -20,8 +21,14 @@ dependencies:
   - numpy
   - scipy
   - pip:
-      - --find-links https://data.pyg.org/whl/torch-2.7.0+cu126.html
-      - torch-geometric==2.5.3
+      # PyTorch 2.8.0 + CUDA 12.8
+      - --extra-index-url https://download.pytorch.org/whl/cu128
+      - torch==2.8.0+cu128
+      - torchvision==0.23.0+cu128
+      - torchaudio==2.8.0+cu128
+      # PyG + extension wheels built against torch 2.8.0 / cu128
+      - --find-links https://data.pyg.org/whl/torch-2.8.0+cu128.html
+      - torch-geometric==2.7.0
       - pyg_lib
       - torch_scatter
       - torch_sparse
@@ -40,3 +47,10 @@ dependencies:
       - nequip-allegro==0.7.0
       # - fairchem-core --no-deps
       - pymatgen
+      # Neighbour search on GPU (backbone use_faiss=True, the default).
+      - faiss-gpu==1.14.3
+      # Simulation stack (molfm.interface.ase): HDF5 trajectories, the Fire-based
+      # CLI, and .pdb/.gro structure reading.
+      - h5py
+      - fire
+      - MDAnalysis

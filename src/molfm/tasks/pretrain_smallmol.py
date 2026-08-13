@@ -153,7 +153,8 @@ class SmallMolConfig(DistributedTrainConfig):
     # swanlab
     swanlab: bool = False
     swanlab_project: str = "mfm"
-    swanlab_workspace: str = "AlphaLab"
+    # Empty = the account's own default workspace.
+    swanlab_workspace: str = ""
 
     # early stopping
     early_stopping: bool = False
@@ -249,7 +250,16 @@ class MolfmAtomic(torch.nn.Module):
 
         return result_dict
 
-    def compile_model(self):
+    def compile_model(self, recompute_budget: float = -1.0):
+        """Configure and apply torch.compile.
+
+        Args:
+            recompute_budget: activation-memory budget in [0, 1] handed to the
+                min-cut partitioner — the fraction of activations kept in memory,
+                the remainder recomputed in the backward pass. Lower values trade
+                compute for memory, which is what makes large systems fit. The
+                default -1.0 leaves the partitioner alone.
+        """
         try:
             from torch import _dynamo as torch_dynamo
             torch_dynamo.config.suppress_errors = True
@@ -257,6 +267,17 @@ class MolfmAtomic(torch.nn.Module):
             if hasattr(torch_dynamo.config, "cache_size_limit"):
                 # Keep more shape variants cached to avoid frequent eviction/recompile.
                 torch_dynamo.config.cache_size_limit = 128
+        except Exception:
+            pass
+        try:
+            from torch._functorch import config as functorch_config
+            # Donated buffers let the partitioner reuse input storage in the
+            # backward pass; incompatible with holding on to activations across
+            # steps as the MD path does.
+            if hasattr(functorch_config, "donated_buffer"):
+                functorch_config.donated_buffer = False
+            if recompute_budget >= 0.0 and hasattr(functorch_config, "activation_memory_budget"):
+                functorch_config.activation_memory_budget = recompute_budget
         except Exception:
             pass
         try:

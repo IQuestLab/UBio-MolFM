@@ -3,4 +3,5 @@ __pycache__/
 *.whl
 *.png
 *.pyc
+runs/
 .vscode

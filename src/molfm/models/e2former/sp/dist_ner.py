@@ -87,11 +87,35 @@ def distributed_cell_expand(
 
 
 class FaissSearch:
-    def __init__(self, rank=0) -> None:
-        res = faiss.StandardGpuResources()
+    def __init__(self, rank=None, temp_memory_bytes: int | None = 0) -> None:
+        """GPU brute-force radius search backend.
+
+        ``rank`` is the CUDA device ordinal the index is built on. It defaults to
+        the calling thread's *current* device rather than 0, so that a model
+        placed on ``cuda:N`` does not silently build its neighbour index on
+        ``cuda:0`` (which both wastes memory on card 0 and hands cross-device
+        pointers to ``cudaMemcpyAsync``).
+
+        ``temp_memory_bytes`` is forwarded to ``setTempMemory``; the default 0
+        disables FAISS' pre-allocated scratch arena so it does not compete with
+        PyTorch's caching allocator for the same GPU memory.
+        """
+        if rank is None:
+            if not torch.cuda.is_available():
+                raise RuntimeError("FaissSearch requires CUDA, but CUDA is not available.")
+            rank = torch.cuda.current_device()
+
+        self.rank = int(rank)
+        # Keep a reference: GpuIndexFlatL2 does not own the resources object, so
+        # letting it be garbage-collected would leave the index with a dangling
+        # handle.
+        self.res = faiss.StandardGpuResources()
+        if temp_memory_bytes is not None:
+            self.res.setTempMemory(int(temp_memory_bytes))
+
         cfg = faiss.GpuIndexFlatConfig()
-        cfg.device = rank
-        self.index = faiss.GpuIndexFlatL2(res, 3, cfg)
+        cfg.device = self.rank
+        self.index = faiss.GpuIndexFlatL2(self.res, 3, cfg)
 
     def _estimate_max_neighbors(self, X_query, X_candidate, max_dist, sample_size=64, min_floor=1):
         if X_candidate.numel() == 0:

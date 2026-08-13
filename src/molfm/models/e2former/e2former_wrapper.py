@@ -103,9 +103,24 @@ class E2FormerBackbone(nn.Module):
         torch._logging.set_logs(recompiles=True)
 
         self.construct_neighbor = construct_radius_neighbor
-        if self.use_faiss:
-            self._faiss_neighbor_constructor = FaissSearch(rank=0)
-            self.construct_neighbor = self._faiss_neighbor_constructor.construct_radius_neighbor
+        # The FAISS index is built lazily on first use, NOT here. Constructing it
+        # in __init__ pins it to whatever the current CUDA device happens to be
+        # while the module is still on CPU (i.e. cuda:0), so a model later moved
+        # to cuda:N would keep searching neighbours through an index on card 0.
+        # Deferring to forward() means the index lands on the device the model is
+        # actually running on. It also keeps __init__ usable without CUDA.
+        self._faiss_neighbor_constructor = None
+
+    def _ensure_faiss_neighbor_constructor(self):
+        """Build (once) and return the FAISS-backed neighbour search object."""
+        if not self.use_faiss:
+            return None
+        if self._faiss_neighbor_constructor is None:
+            if not torch.cuda.is_available():
+                raise RuntimeError("use_faiss=True requires CUDA, but CUDA is not available.")
+            device_idx = torch.cuda.current_device()
+            self._faiss_neighbor_constructor = FaissSearch(rank=device_idx)
+        return self._faiss_neighbor_constructor
 
     def BOO_feature(self, pos, expand_pos, local_attention_weight):
         B, N1 = pos.shape[:2]
@@ -144,6 +159,14 @@ class E2FormerBackbone(nn.Module):
         pos = batched_data["pos"]
         B, L = batched_data["pos"].shape[:2]
         device = pos.device
+
+        # Resolve the neighbour-search backend for this forward pass. With
+        # use_faiss=True this builds the GPU index on first call (see
+        # _ensure_faiss_neighbor_constructor); otherwise it is the plain
+        # construct_radius_neighbor bound in __init__.
+        construct_neighbor = self.construct_neighbor
+        if self.use_faiss:
+            construct_neighbor = self._ensure_faiss_neighbor_constructor().construct_radius_neighbor
 
         # Handle periodic boundary conditions
 
@@ -191,7 +214,7 @@ class E2FormerBackbone(nn.Module):
         ptr = torch.nn.functional.pad(node_mask.sum(-1).to(torch.int32).cumsum(0), (1, 0))
         batched_data.update({"f_exp_node_pos":batched_data["expand_node_pos"][batched_data["expand_node_mask"]],
             "f_outcell_index": (batched_data["outcell_index"] + ptr[:B, None])[batched_data["expand_node_mask"]]})
-        neighbor_info = self.construct_neighbor(pos,node_mask,
+        neighbor_info = construct_neighbor(pos,node_mask,
                     batched_data["expand_node_pos"],batched_data["expand_node_mask"],
                         max_dist = self.max_radius,
                         min_dist = 1e-4,
@@ -205,7 +228,7 @@ class E2FormerBackbone(nn.Module):
                 exp_atomic_numbers,
                 torch.tensor([0, 1], device=exp_atomic_numbers.device),
             )
-            cluster_neighbor_info = self.construct_neighbor(
+            cluster_neighbor_info = construct_neighbor(
                 pos,
                 node_mask,
                 batched_data["expand_node_pos"],
