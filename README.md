@@ -227,6 +227,25 @@ frame = H5Trajectory.read_last_frame("runs/my_job_md.h5")
 print(frame["n_frames"], frame["steps"], frame["positions"].shape)
 ```
 
+### Example 4: OpenMM via OpenMM-ML
+
+UBio-MolFM can also run inside [OpenMM](https://openmm.org), through the [openmmml-ubiomolfm](https://github.com/Cedrus810/UBio-MolFM_OpenMM-ML) plugin for [OpenMM-ML](https://github.com/openmm/openmm-ml). It can model a whole system, or the ML region of a mixed ML/MM system with a classical force field.
+
+```bash
+pip install "git+https://github.com/Cedrus810/UBio-MolFM_OpenMM-ML#subdirectory=openmmml-ubiomolfm"
+```
+
+```python
+from openmmml import MLPotential
+
+potential = MLPotential("ubiomolfm",
+                        checkpointPath="ckpt/molfm-v1p5/molfm-v1p5-stage-3.pt",
+                        headName="omol25")
+system = potential.createSystem(topology, charge=0, multiplicity=1, mlPBC=False)
+```
+
+The plugin is maintained separately. See its README for the options and what has been validated.
+
 ### Performance Notes
 
 - `use_tf32=True` enables TensorFloat-32 on supported NVIDIA GPUs. It typically improves throughput, but it may introduce a small loss in numerical precision.

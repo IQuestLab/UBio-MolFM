@@ -39,11 +39,16 @@ dependencies:
 
       - triton
       - hydra-core
-      - e3nn
+      # molfm imports e3nn.o3._wigner._su2_clebsch_gordan, which e3nn 0.4.x lacks.
+      - e3nn>=0.5.0
       - ase
       - ase_db_backends
       - rdkit
       - wandb==0.21.0
+      # Imported by molfm.tasks.pretrain_smallmol and molfm.logging, which the
+      # inference interface also loads.
+      - swanlab
+      - aim
       - nequip-allegro==0.7.0
       # - fairchem-core --no-deps
       - pymatgen
