@@ -14,6 +14,7 @@
 backbone: e2former
 dataset_name_list: omol25
 AutoGradForce: true
+lf_O_in_HOH: false
 
 backbone_config:
   name: e2former

@@ -314,7 +314,7 @@ Key options:
 | `--recompute` | Activation-memory budget in `[0, 1]` for `torch.compile`; lower trades compute for memory. |
 | `--barostat_mode` | NPT box coupling: `isotropic` (default) scales all three axes; `semiiso` couples the two in-plane axes and the out-of-plane axis separately (use with `--barostat_dlnV_z`). |
 | `--barostat_interval` / `--barostat_dlnV` / `--barostat_dlnV_z` | MC-barostat attempt interval, isotropic volume move size, and (semiiso only) thickness move size. |
-| `--lf_o_in_hoh` | Route water oxygens through the mixed-resolution LIGHT stream. Set only for checkpoints trained with `lf_O_in_HOH=True`. |
+| `--lf_o_in_hoh` | Optional override for water-O light routing. When omitted, inferred from the checkpoint config's `lf_O_in_HOH`. |
 | `--hoh_o_fudge_factor` | Bond-detection scale used by `--lf_o_in_hoh` when the input has no residue names (default `0.55`). |
 
 Trajectories land in `<work_dir>/<name>_relax.h5` and `<work_dir>/<name>_md.h5`. Because `--resume` is on by default, re-running the same `--work_dir`/`--name` continues the existing trajectory and ignores the geometry input — the input is still read to check that it describes the same system (same atomic numbers), and the run aborts rather than silently extending a different system's trajectory. Use a fresh `--name` or `--resume False` to start over.
@@ -380,6 +380,9 @@ python src/molfm/interface/ase/cli.py \
     --device cuda:0 --work_dir runs --name water216_nvt_100ps_v2_flash
 ```
 
+`lf_O_in_HOH` routing is inferred from the checkpoint's own config; pass
+`--lf_o_in_hoh True/False` only to override it.
+
 > **Note**: The `standard/` and `flash/` checkpoints are placeholders until the real weights are uploaded.
 
 ### Performance Notes
@@ -424,6 +427,34 @@ UBio-MolFM supports three data entry modes:
 
 - **LMDB datasets**: the loader recursively scans a directory for `.lmdb` or `.aselmdb` files.
 - **SPICE xyz files**: set `dataset_name_list=spice` and point `data_path_list` and `data_path_list_valid` to `.xyz` files.
+
+#### HOH-O sidecars for Flash training
+
+Flash training uses `lf_O_in_HOH=True`, so each LMDB shard needs a matching
+`<db>.hoh_o_mask.npy` sidecar. Generate it with
+`src/molfm/scripts/precompute_hoh_o_mask.py`:
+
+```bash
+# OMol25 train + validation splits (non-periodic clusters)
+python src/molfm/scripts/precompute_hoh_o_mask.py \
+    --data_path data/omol25/train data/omol25/val_1M \
+    --pbc false --workers 16
+```
+
+Use `--pbc auto` for periodic solvent boxes (each sample's own cell/pbc is
+used), or `--pbc true` to force the PBC-aware neighbor backend. The script is
+idempotent: shards whose sidecar already exists and matches the row count are
+skipped; pass `--force` to recompute. A dry run that only reports statistics
+without writing anything:
+
+```bash
+python src/molfm/scripts/precompute_hoh_o_mask.py \
+    --data_path data/omol25/train --pbc false --workers 1 --validate_only
+```
+
+The sidecar stores one `uint8` flag per atom, concatenated in LMDB row order.
+If a sidecar is missing, the loader falls back to an all-zero mask for that
+shard, which effectively disables the HOH-O light routing (a warning is logged).
 
 The training scripts interpret `data_path_list` and `data_path_list_valid` relative to `data_path`. The shipped shell scripts use the repository `data/` directory as the root by default.
 

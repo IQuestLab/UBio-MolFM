@@ -120,7 +120,7 @@ class ASERunner:
         qtb_classical: bool = False,
         qtb_n_seg: int = 4096,
         qtb_adqtb_lr: float = 0.005,
-        lf_o_in_hoh: bool = False,
+        lf_o_in_hoh: Optional[bool] = None,
         hoh_o_fudge_factor: float = 0.55,
     ):
         # Single-GPU only. A torchrun/mpirun launcher exports WORLD_SIZE > 1;
@@ -192,7 +192,9 @@ class ASERunner:
         # computed once from the FULL structure (see _build_hoh_o_mask). Canonical
         # atom order is preserved throughout single-GPU execution, so the mask
         # stays aligned with the atoms for the whole run.
-        self.lf_o_in_hoh = bool(lf_o_in_hoh)
+        # None means "infer from the checkpoint config"; resolved after the
+        # calculator has loaded that config.
+        self._lf_o_in_hoh_requested = lf_o_in_hoh
         self.hoh_o_fudge_factor = float(hoh_o_fudge_factor)
         # Canonical [N] bool mask, or None. Set by _setup() once the full
         # structure is known and read back into the calculator.
@@ -204,6 +206,22 @@ class ASERunner:
             recompute_budget=recompute_budget,
             charge=charge, multiplicity=multiplicity,
         )
+
+        # Resolve the water-O routing policy. An explicit CLI value wins; when
+        # omitted, use the lf_O_in_HOH flag stored in the checkpoint config so a
+        # Flash checkpoint is not silently run with the heavy-stream routing.
+        if self._lf_o_in_hoh_requested is None:
+            _cfg = getattr(self.calc, "model_cfg", None)
+            lf_o_in_hoh = bool(getattr(_cfg, "lf_O_in_HOH", False))
+            logger.info(
+                "lf_O_in_HOH not set; inferred from checkpoint config: {}",
+                lf_o_in_hoh,
+            )
+        else:
+            lf_o_in_hoh = bool(self._lf_o_in_hoh_requested)
+        self.lf_o_in_hoh = bool(lf_o_in_hoh)
+        if swanlab_config is not None:
+            swanlab_config["lf_o_in_hoh"] = self.lf_o_in_hoh
 
         # Atoms and global-state tracking are created lazily in _setup().
         self.atoms = None

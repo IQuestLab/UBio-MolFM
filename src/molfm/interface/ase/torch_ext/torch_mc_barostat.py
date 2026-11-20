@@ -189,8 +189,7 @@ class TorchMCBarostat:
         # Thickness moves need their own step size. For the same ln-V step the
         # per-axis strain is delta/2 for an area move but delta for a thickness
         # move, so sharing one dlnV makes z-moves ~2x larger and they get
-        # rejected almost always (observed: 0/10 accepted at dlnV=0.002 on a
-        # POPE:POPG bilayer). Default to dlnV/2 -> equal per-axis strain.
+        # rejected almost always. Default to dlnV/2 -> equal per-axis strain.
         self.dlnV_z = float(dlnV_z) if dlnV_z is not None else 0.5 * float(dlnV)
         self.device = device
         self.dtype = dtype

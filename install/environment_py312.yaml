@@ -45,6 +45,7 @@ dependencies:
       - rdkit
       - wandb==0.21.0
       - aim==3.29.1
+      - tqdm==4.67.3
       - nequip-allegro==0.7.0
       # fairchem-core: required by the s2 / spectral mixed-resolution FFN
       # (molfm.models.e2former.uma_utils). Not listed here because its torch

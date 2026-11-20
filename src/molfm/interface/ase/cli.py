@@ -204,7 +204,7 @@ def run(
     charge: int = 0,
     multiplicity: int = 1,
     seed: int = 42,
-    lf_o_in_hoh: bool = False,
+    lf_o_in_hoh: Optional[bool] = None,
     hoh_o_fudge_factor: float = 0.55,
     # Numpy-style inputs via fire
     pos: Optional[Union[List[List[float]], str]] = None,
@@ -299,13 +299,12 @@ def run(
             thermostat noise stream. Default 42 preserves prior behavior;
             change it to draw a different velocity realization.
         lf_o_in_hoh: Route water oxygens through the mixed-resolution LIGHT
-            stream. Set this to True (and only then) for checkpoints trained
-            with lf_O_in_HOH=True — otherwise those atoms go through the HEAVY
-            stream, which does not match training. The mask comes from
-            residuenames (HOH/WAT/SOL) when the input carries them, else from a
-            geometric "O with exactly two H" rule. It is built once from the
-            full structure, is static for the whole trajectory, and is preserved
-            across MC-barostat volume moves.
+            stream. If omitted, the value is inferred from the checkpoint
+            config's lf_O_in_HOH; pass True/False only to override it. The mask
+            comes from residue names (HOH/WAT/SOL) when the input carries them,
+            else from a geometric "O with exactly two H" rule. It is built once
+            from the full structure, is static for the whole trajectory, and is
+            preserved across MC-barostat volume moves.
         hoh_o_fudge_factor: bond-criterion scale for the bond-graph water
             detection used when the input has no residue names:
             bond(i,j) iff 0.1 A < d < (vdw_i + vdw_j) * fudge. Default 0.55,
@@ -377,6 +376,7 @@ def run(
         swanlab_config=full_config
     )
 
+    full_config["lf_o_in_hoh"] = runner.lf_o_in_hoh
     _print_config_summary(full_config, runner)
 
     # Stage 1: Structure Relaxation (GO)

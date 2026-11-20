@@ -5,10 +5,10 @@
 #       --input_path tools/samples/water216_nvt.xyz \
 #       --checkpoint /path/to/flash.pt \
 #       --config config_file/examples/flash.yaml \
-#       --head_name omol25 --lf_o_in_hoh True ...
+#       --head_name omol25 ...
 #
-# Flash routes hydrogens AND water oxygens through the light stream, so
-# --lf_o_in_hoh True is required (it is a runtime flag, not a config key).
+# Flash routes hydrogens AND water oxygens through the light stream.
+# lf_O_in_HOH: true below is read automatically; --lf_o_in_hoh can override it.
 #
 # The backbone block must match the checkpoint architecture exactly:
 # load_state_dict runs with strict=False, so a mismatch silently leaves
@@ -17,6 +17,7 @@
 backbone: e2former
 dataset_name_list: omol25
 AutoGradForce: true
+lf_O_in_HOH: true
 
 backbone_config:
   name: e2former
