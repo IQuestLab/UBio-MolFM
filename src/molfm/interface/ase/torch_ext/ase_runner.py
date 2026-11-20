@@ -1,5 +1,3 @@
-# Description: High-performance single-GPU ASERunner for GPU-native simulations.
-
 import atexit
 import math
 import os
@@ -27,6 +25,11 @@ from molfm.interface.ase.torch_ext.torch_constraints import FixCom
 from molfm.interface.ase.torch_ext.torch_mc_barostat import (
     TorchMCBarostat, build_molecule_index, molecule_first_atom, masses_from_numbers,
 )
+
+
+def _needs_terminal_frame_save(step_offset: int, target_step: int, interval: int) -> bool:
+    """Return whether a completed run still needs a non-cadence terminal frame."""
+    return target_step > step_offset and target_step % interval != 0
 
 
 def _resolve_array(value, *, kind: str, required: bool):
@@ -95,7 +98,7 @@ class ASERunner:
         name: str = "mfm_md",
         use_swanlab: bool = False,
         project_name: str = "MolFM-MD",
-        full_sync_interval: int = 10,
+        global_sync_interval: int = 10,
         log_interval: int = 10,
         resume_step: Optional[int] = None,
         fixcm: bool = True,
@@ -108,6 +111,8 @@ class ASERunner:
         pressure_bar: float = 1.0,
         barostat_interval: int = 50,
         barostat_dlnV: float = 0.002,
+        barostat_dlnV_z: Optional[float] = None,
+        barostat_mode: str = "isotropic",
         molecule_source: str = "auto",
         barostat_seed: int = 12345,
         thermostat: str = "langevin",
@@ -115,12 +120,25 @@ class ASERunner:
         qtb_classical: bool = False,
         qtb_n_seg: int = 4096,
         qtb_adqtb_lr: float = 0.005,
+        lf_o_in_hoh: bool = False,
+        hoh_o_fudge_factor: float = 0.55,
     ):
+        # Single-GPU only. A torchrun/mpirun launcher exports WORLD_SIZE > 1;
+        # silently taking one rank's share of the work there would produce a
+        # truncated trajectory with no error, so fail closed instead.
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        if world_size > 1:
+            raise RuntimeError(
+                f"ASERunner is single-GPU only, but the launcher started "
+                f"WORLD_SIZE={world_size} processes. Run without torchrun "
+                f"(python ...) or set --nproc_per_node 1."
+            )
         torch.backends.cudnn.benchmark = True
 
         self.device = device
+
         self.head_name = head_name
-        self.full_sync_interval = full_sync_interval
+        self.global_sync_interval = global_sync_interval
         self.log_interval = log_interval
         self.resume_step = resume_step
         self.wrap = True
@@ -128,19 +146,21 @@ class ASERunner:
         self.save_in_fp32 = save_in_fp32
         self.charge = charge
         self.multiplicity = multiplicity
-        # MD seed: drives the Maxwell-Boltzmann initial velocities and the
-        # thermostat noise stream, so a run is reproducible for a fixed seed.
+        # MD seed: controls the Maxwell-Boltzmann velocity draw and the
+        # Langevin noise stream.
         self.seed = int(seed)
         os.makedirs(work_dir, exist_ok=True)
 
         # NPT / barostat configuration. The barostat object itself is built lazily
-        # in run_md() once the configuration (and molecule map) is known.
+        # in run_md() once the global configuration (and molecule map) is known.
         self.ensemble = str(ensemble).lower()
         if self.ensemble not in ("nvt", "npt", "nve"):
             raise ValueError(f"ensemble must be 'nvt', 'npt', or 'nve', got {ensemble!r}")
         self.pressure_bar = pressure_bar
         self.barostat_interval = barostat_interval
         self.barostat_dlnV = barostat_dlnV
+        self.barostat_mode = barostat_mode
+        self.barostat_dlnV_z = barostat_dlnV_z
         self.molecule_source = molecule_source
         self.barostat_seed = barostat_seed
         self.barostat: Optional[TorchMCBarostat] = None
@@ -163,10 +183,20 @@ class ASERunner:
         self._numbers = numbers
         self._cell = cell
         self._pbc = pbc
-        # The geometry input is read at most once, and is needed even on a resume
-        # (to verify the trajectory describes the same system).
-        self._input_atoms_cache: Optional[Atoms] = None
+        # Lazily loaded geometry input, used only to verify that a resume file
+        # belongs to the same system (see _check_resume_matches_input).
+        self._input_atoms_cache = None
         self.dyn = None
+
+        # Mixed-resolution light-stream routing for water oxygens. The mask is
+        # computed once from the FULL structure (see _build_hoh_o_mask). Canonical
+        # atom order is preserved throughout single-GPU execution, so the mask
+        # stays aligned with the atoms for the whole run.
+        self.lf_o_in_hoh = bool(lf_o_in_hoh)
+        self.hoh_o_fudge_factor = float(hoh_o_fudge_factor)
+        # Canonical [N] bool mask, or None. Set by _setup() once the full
+        # structure is known and read back into the calculator.
+        self.hoh_o_mask = None
 
         self.calc = E2FormerCalculator(
             checkpoint_path=checkpoint_path, config_path=config_path, head_name=head_name,
@@ -175,19 +205,18 @@ class ASERunner:
             charge=charge, multiplicity=multiplicity,
         )
 
-        # Atoms are created lazily in _setup().
+        # Atoms and global-state tracking are created lazily in _setup().
         self.atoms = None
-        self.full_numbers = None
-        self.full_pbc = None
-        self.full_natoms = 0
+        self.global_numbers = None
+        self.global_pbc = None
+        self.global_natoms = 0
 
         self.relax_path = os.path.join(work_dir, f"{name}_relax.h5")
         self.md_path = os.path.join(work_dir, f"{name}_md.h5")
 
-        # Logger setup.
-        # Init runs AFTER trajectory paths are resolved so we can publish the
-        # absolute on-disk paths to the run config (useful for re-locating output
-        # later from the SwanLab UI).
+        # Logger setup. Init runs AFTER trajectory paths are resolved so we can
+        # publish the absolute on-disk paths to the run config (useful for
+        # re-locating output later from the SwanLab UI).
         self.use_swanlab = use_swanlab
         if self.use_swanlab and swanlab is None:
             logger.warning(
@@ -206,18 +235,21 @@ class ASERunner:
             swan_cfg["md_traj_path"] = os.path.abspath(self.md_path)
             swanlab.init(project=project_name, experiment_name=name, workspace=workspace, config=swan_cfg)
 
-        # State tracking for H5 writing and logging.
+        # State tracking for the H5 trajectory and logging.
         self.trajectory: Optional[H5Trajectory] = None
         self.step_offset = 0
 
         self._metrics_cache: Optional[Dict[str, float]] = None
-        self._has_atoms = False
+        self._has_local_atoms = False
         self._stop_requested = False
         self._cleanup_registered = False
         self._register_cleanup_handlers()
 
+    def _should_participate_in_steps(self) -> bool:
+        return self._has_local_atoms
+
     def _open_trajectory(self, path: str, fresh: bool = False):
-        """Create the trajectory writer."""
+        """Create the H5 trajectory writer."""
         if self.trajectory is not None:
             self._close_trajectory()
 
@@ -228,14 +260,12 @@ class ASERunner:
         try:
             self.trajectory = self._get_traj_writer(path, mode)
         except Exception as exc:
-            if fresh:
-                raise
-            logger.error(
-                f"Failed to open trajectory {path} in append mode — existing "
-                f"file may be corrupted: {exc}.  Recreating from scratch "
-                f"(all prior frames will be lost)."
-            )
-            self.trajectory = self._get_traj_writer(path, "w")
+            if not fresh:
+                raise RuntimeError(
+                    f"Failed to open existing trajectory {path} in append mode; "
+                    "refusing to recreate it or lose resume history"
+                ) from exc
+            raise
         return self.trajectory
 
     @staticmethod
@@ -267,8 +297,8 @@ class ASERunner:
 
         def _handle_signal(signum, _frame):
             logger.warning(
-                f"Received signal {signum}, "
-                "requesting graceful stop (will finish current step and save final frame)."
+                f"Received signal {signum}, requesting graceful stop "
+                "(will finish current step and save final frame)."
             )
             self._stop_requested = True
 
@@ -279,12 +309,12 @@ class ASERunner:
                 pass
 
     def _should_save_step(self, step: int) -> bool:
-        return step > 0 and step % self.full_sync_interval == 0
+        return step > 0 and step % self.global_sync_interval == 0
 
     def _should_log_step(self, step: int) -> bool:
         return step > 0 and step % self.log_interval == 0
 
-    def _load_full_atoms( self, input_path, pos, nums, cell, pbc,) -> Atoms:
+    def _load_global_atoms( self, input_path, pos, nums, cell, pbc,) -> Atoms:
         """Load the full system.
 
         ``pos`` / ``nums`` / ``cell`` may each be an ndarray, a list, or a path
@@ -316,7 +346,7 @@ class ASERunner:
         if self._input_path is None and self._numbers is None and self._positions is None:
             return None
         if self._input_atoms_cache is None:
-            self._input_atoms_cache = self._load_full_atoms(
+            self._input_atoms_cache = self._load_global_atoms(
                 self._input_path, self._positions, self._numbers, self._cell, self._pbc
             )
         return self._input_atoms_cache
@@ -324,7 +354,7 @@ class ASERunner:
     def _check_resume_matches_input(self, resumed: Atoms, resume_path: str):
         """Abort when the trajectory being resumed holds a different system.
 
-        A resume ignores the geometry input entirely — positions, cell and
+        A resume ignores the geometry input entirely -- positions, cell and
         velocities all come from the trajectory. With resume on by default and a
         default ``name``, a second run in the same work_dir would otherwise
         silently continue the *previous* system's trajectory while reporting the
@@ -340,7 +370,7 @@ class ASERunner:
             return
         raise ValueError(
             f"Refusing to resume from {resume_path}: it holds a different system than "
-            f"the geometry input — input is {reference.get_chemical_formula()} "
+            f"the geometry input -- input is {reference.get_chemical_formula()} "
             f"({len(reference)} atoms), trajectory is {resumed.get_chemical_formula()} "
             f"({len(resumed)} atoms). Use a different --name / --work_dir, remove the "
             "old trajectory, or pass --resume False to start from the input."
@@ -367,11 +397,80 @@ class ASERunner:
     # Unified setup (initial or resume)
     # ------------------------------------------------------------------
 
+    def _guess_hoh_o(self, atoms_full, Z: np.ndarray) -> np.ndarray:
+        """Bond-graph water detection — see _build_hoh_o_mask for the contract.
+
+        Delegates to ``molfm.data.hoh_o_mask.predict_hoh_o_mask``, the SAME function the
+        training-time ``<db>.hoh_o_mask.npy`` sidecars are generated with, so the light
+        routing here can never drift from the routing the model was trained under. That
+        function picks its neighbour backend from ``cell``/``pbc``: ASE's PBC-aware cell
+        list for a periodic box (required — otherwise waters straddling a face split into
+        1- and 2-atom fragments and are silently routed HEAVY), and scipy's cKDTree
+        otherwise (bit-identical to the aperiodic generator).
+        """
+        from molfm.data.hoh_o_mask import predict_hoh_o_mask
+
+        return predict_hoh_o_mask(
+            atoms_full.get_positions(),
+            Z,
+            cell=atoms_full.get_cell(),
+            pbc=atoms_full.pbc,
+            fudge_factor=self.hoh_o_fudge_factor,
+        ).astype(bool)
+
+    def _build_hoh_o_mask(self, atoms_full) -> np.ndarray:
+        """Per-atom bool mask [N] marking water oxygens for the MR light stream.
+
+        Two rules, in order of preference:
+          1. ``residuenames`` (present on PDB/GRO input) — O whose residue is
+             HOH / WAT / SOL.
+          2. Geometric fallback (xyz input carries no residues) — reproduces the
+             rule the *training* sidecars were generated with
+             (``molfm.data.hoh_o_mask.predict_hoh_o_mask``,
+             itself an MDAnalysis ``guess_bonds`` equivalent):
+                 bond(i, j)  iff  0.1 A < d(i,j) < (vdw_i + vdw_j) * 0.55
+             then flag the O of every connected fragment that is exactly three
+             atoms with composition {O, H, H}.
+
+        The one deliberate deviation from the training generator: neighbors come
+        from ASE's PBC-aware cell list, not a raw KD-tree. The training data is
+        non-periodic clusters, so the generator never needed the minimum-image
+        convention — but a periodic solvent box does, and without it every water
+        straddling a box face is split into 1- and 2-atom fragments and silently
+        routed HEAVY (on water216: 188/216 instead of 216/216). With ``pbc=False``
+        this function reproduces ``predict_hoh_o_mask`` exactly.
+
+        The mask is static: MD does not break O-H bonds at these timescales, and
+        recomputing it per step would make the routing (and hence the energy
+        surface) discontinuous.
+        """
+        Z = atoms_full.get_atomic_numbers()
+        res = atoms_full.arrays.get("residuenames", None)
+        if res is not None:
+            res_strip = np.array([str(r).strip() for r in res])
+            mask = np.isin(res_strip, ["HOH", "WAT", "SOL"]) & (Z == 8)
+            source = "residuenames"
+        else:
+            mask = self._guess_hoh_o(atoms_full, Z)
+            source = "bond graph (vdW*0.55 fragments, PBC-aware)"
+        mask = mask.astype(bool)
+        n_o = int((Z == 8).sum())
+        logger.info(
+            f"[lf_O_in_HOH] water-O -> LIGHT stream: {int(mask.sum())}/{n_o} "
+            f"oxygens ({int(mask.sum())}/{len(Z)} atoms) via {source}"
+        )
+        if mask.sum() == 0:
+            logger.warning(
+                "[lf_O_in_HOH] mask is empty — the model was trained with "
+                "water-O in the light stream but none were detected."
+            )
+        return mask
+
     def _setup(self, resume_path: Optional[str] = None, reset_step_offset: bool = False):
         """Unified initialization and resume entry.
 
         When atoms have already been initialized and no resume file is found,
-        the current in-memory state is preserved.  This allows sequential
+        the current in-memory state is preserved. This allows sequential
         ``relax()`` → ``run_md()`` calls without losing the relaxed structure.
         """
         # 1. Decide the source: resume from H5 or load from input.
@@ -381,9 +480,16 @@ class ASERunner:
         step_offset = 0 if reset_step_offset else step_offset
         if atoms_full is not None:
             atoms_full.wrap() # Warning: force to wrap here to ensure PBC consistency
-            if self.full_numbers is None:
-                self.full_numbers = torch.from_numpy(atoms_full.get_atomic_numbers())
-                self.full_pbc = torch.from_numpy(np.asarray(atoms_full.pbc))
+            if self.global_numbers is None:
+                self.global_numbers = torch.from_numpy(atoms_full.get_atomic_numbers())
+                self.global_pbc = torch.from_numpy(np.asarray(atoms_full.pbc))
+            # Canonical HOH-O mask, built once from the full structure.
+            # _resolve_source is the single funnel for BOTH the fresh-input and
+            # the H5-resume case -- a resume restores the geometry from the
+            # trajectory file and never re-reads the input, so a mask built from
+            # the input alone would be silently absent on every resumed run.
+            if self.lf_o_in_hoh and self.hoh_o_mask is None:
+                self.hoh_o_mask = self._build_hoh_o_mask(atoms_full)
 
         # 2. If atoms are already initialized and no resume happened, keep
         #    the current state (e.g. relax() finished, now starting run_md()).
@@ -400,65 +506,75 @@ class ASERunner:
             device=self.device,
         )
         self.atoms.calc = self.calc
+        # Canonical atom order is preserved, so the mask built from atoms_full
+        # stays aligned with self.atoms for the whole run.
+        if self.lf_o_in_hoh:
+            self.calc.hoh_o_mask = self.hoh_o_mask
         if self.fixcm and len(self.atoms) > 0:
             self.atoms.set_constraint(FixCom())
-        self._has_atoms = len(self.atoms) > 0
-        self.full_natoms = len(self.atoms)
+        self._has_local_atoms = len(self.atoms) > 0
+        self.global_natoms = len(self.atoms)
         self.step_offset = step_offset
         if atoms_full.has("momenta"):
             self.atoms.set_velocities(atoms_full.get_velocities())
 
     def _resolve_source(self, resume_path: Optional[str] = None):
-        """Load from resume H5 or fall back to initial input.
+        """Load from a resume H5 file, or fall back to the initial input.
 
         Returns:
             (atoms_full, step_offset, did_resume)
             did_resume is True when the structure was restored from an H5 file.
         """
         if resume_path is not None and os.path.exists(resume_path):
-            restored = None
             try:
-                data = H5Trajectory.read_last_frame(resume_path)
-                if data["positions"] is not None and data["n_frames"] > 0:
-                    # H5 is self-contained: cell, pbc, numbers are always present.
-                    step_offset = data["steps"] if data["steps"] is not None else (
-                        (data["n_frames"] - 1) * self.full_sync_interval
-                    )
-                    atoms = Atoms(
-                        numbers=data["numbers"],
-                        positions=data["positions"],
-                        cell=data["cell"],
-                        pbc=data["pbc"],
-                    )
-                    if data["velocities"] is not None:
-                        atoms.set_velocities(data["velocities"])
-                    restored = (atoms, step_offset)
+                data = H5Trajectory.read_last_frame(resume_path, committed_only=True)
             except Exception as e:
-                logger.warning(f"Resume failed: {e}, falling back to initial input")
+                raise RuntimeError(
+                    f"Existing trajectory {resume_path} could not be resumed; "
+                    "refusing to fall back to the initial input"
+                ) from e
 
-            if restored is not None:
-                atoms, step_offset = restored
+            if data["positions"] is not None and data["n_frames"] > 0:
+                # H5 is self-contained: cell, pbc, numbers are always present.
+                step_offset = data["steps"] if data["steps"] is not None else (
+                    (data["n_frames"] - 1) * self.global_sync_interval
+                )
+                atoms = Atoms(
+                    numbers=data["numbers"],
+                    positions=data["positions"],
+                    cell=data["cell"],
+                    pbc=data["pbc"],
+                )
+                if data["velocities"] is not None:
+                    atoms.set_velocities(data["velocities"])
                 # Raised outside the try above on purpose: a system mismatch is a
                 # user error to fix, not something to silently fall back from.
                 self._check_resume_matches_input(atoms, resume_path)
-                logger.warning(
-                    f"Resumed from {resume_path} at step {step_offset} — the geometry "
-                    "input is ignored (positions, cell and velocities come from the "
-                    "trajectory). Pass --resume False to start from the input instead."
+                logger.info(
+                    f"Resumed from {resume_path} at step {step_offset}"
                 )
                 return atoms, step_offset, True
+
+            # The file exists but holds no committed frame (a run killed between
+            # creating the writer and its first append leaves one behind). There
+            # is no history to preserve, so start over from the input rather than
+            # failing every later rerun until the file is deleted by hand.
+            logger.warning(
+                f"Existing trajectory {resume_path} contains no committed frame; "
+                "starting from the input instead"
+            )
 
         # Not a resume.  If atoms are already initialized, preserve the
         # current in-memory state instead of reloading from the source file.
         if self.atoms is not None:
             return None, 0, False
 
-        atoms = self._input_atoms()
-        if atoms is None:
-            raise ValueError(
-                "No geometry source to start from: provide input_path, or both "
-                "positions and numbers."
-            )
+        atoms = self._load_global_atoms(
+            self._input_path, self._positions, self._numbers, self._cell, self._pbc
+        )
+        # Keep the reference so a later relax -> MD transition can verify the
+        # resume file without reading the input a second time.
+        self._input_atoms_cache = atoms
         return atoms, 0, False
 
     def _resolve_md_source(self, do_resume: bool = True):
@@ -476,9 +592,9 @@ class ASERunner:
             logger.warning("[MD] Atoms source: initial input (do_resume=False)")
             return None, "initial"
 
-        if os.path.exists(self.md_path):
+        if os.path.exists(self.md_path) and self._trajectory_has_committed_frames(self.md_path):
             source_tag = "md_resume"
-        elif os.path.exists(self.relax_path):
+        elif os.path.exists(self.relax_path) and self._trajectory_has_committed_frames(self.relax_path):
             source_tag = "relax_transition"
         else:
             source_tag = "initial"
@@ -496,6 +612,20 @@ class ASERunner:
 
         return resume_path, source_tag
 
+    @staticmethod
+    def _trajectory_has_committed_frames(path: str) -> bool:
+        """Whether *path* holds at least one committed frame.
+
+        Used only to choose between md / relax / input as the start of an MD run.
+        An unreadable file returns True so that the normal fail-closed path
+        still raises instead of silently starting from an earlier stage.
+        """
+        try:
+            data = H5Trajectory.read_last_frame(path, committed_only=True)
+        except Exception:
+            return True
+        return data["n_frames"] > 0 and data["positions"] is not None
+
     def _truncate_trajectory_to_step(self, resume_path: str) -> int:
         """Truncate H5 trajectory to *resume_step*.
 
@@ -504,7 +634,7 @@ class ASERunner:
         if self.resume_step is None:
             return -1
         n = H5Trajectory.truncate_to_step(resume_path, self.resume_step,
-                                            full_sync_interval=self.full_sync_interval)
+                                            global_sync_interval=self.global_sync_interval)
         logger.warning(
             f"Truncated {resume_path} to step <= {self.resume_step} "
             f"({n} frames retained)"
@@ -512,22 +642,23 @@ class ASERunner:
         return n
 
     def _get_traj_writer(self, path: str, mode='a'):
-        """Build the H5 storage object."""
+        """Initialize the H5 storage object."""
         return H5Trajectory(
             path,
             mode,
-            atomic_numbers=self.full_numbers,
-            pbc=self.full_pbc,
-            natoms=self.full_natoms,
+            atomic_numbers=self.global_numbers,
+            pbc=self.global_pbc,
+            natoms=self.global_natoms,
             save_in_fp32=self.save_in_fp32,
+            recover_on_open_error=(mode == "w"),
             append_only=True,
         )
 
     def _collect_step_data(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, float, float, float]:
-        """Snapshot positions / velocities / forces plus the scalar diagnostics."""
+        """Collect the current positions, velocities, forces and scalar energies."""
         # Detach: the model forward runs with requires_grad=True on positions
         # (for force autograd), so the returned pos/vel/force tensors may carry
-        # a grad graph.  The H5 background writer cannot convert such tensors
+        # a grad graph. The H5 background writer cannot convert such tensors
         # to numpy, and gradients are not needed beyond this point anyway.
         pos = self.atoms.get_positions()
         vel = self.atoms.get_velocities()
@@ -540,7 +671,6 @@ class ASERunner:
             force = force.detach()
         epot = float(self.atoms.get_potential_energy())
         ekin = float(self.atoms.get_kinetic_energy())
-
         f_norms = torch.norm(force, dim=1) if hasattr(force, "norm") else torch.zeros(1)
         fmax = float(f_norms.max().item()) if f_norms.numel() > 0 else 0.0
         return pos, vel, force, epot, ekin, fmax
@@ -585,21 +715,21 @@ class ASERunner:
                   accurate resume offset.
         """
         pos, vel, force, epot, ekin, fmax = self._collect_step_data()
-        # Cache metrics to avoid recomputing them in the subsequent _log_step call
+        # Cache metrics to avoid recomputing them in the subsequent _log_step call.
         self._metrics_cache = {"epot": epot, "ekin": ekin, "fmax": fmax, "etot": epot + ekin}
 
         cell = self.atoms.get_cell()
         # Guard: the per-frame cell must be finite with a positive volume.
         # Catches silent box corruption (e.g. a stale/zeroed cell slipping
         # through after a barostat move) before it is committed to disk.
-        if self.full_pbc.any():
+        if self.global_pbc.any():
             _vol = float(torch.det(cell).abs().item())
             assert torch.isfinite(cell).all() and _vol > 0.0, (
                 f"[barostat] frame {step}: invalid cell before write "
                 f"(volume={_vol}, diag={torch.diagonal(cell).tolist()})."
             )
-        if self.wrap and self.full_pbc.any():
-            pbc = self.full_pbc
+        if self.wrap and self.global_pbc.any():
+            pbc = self.global_pbc
             if isinstance(pbc, torch.Tensor):
                 pbc = pbc.tolist()
             pos = TorchAtoms.wrap_positions_tensor(
@@ -607,7 +737,7 @@ class ASERunner:
             )
         # QTB diagnostics as per-frame H5 info (empty dict for Langevin/relax ->
         # no info group is created, so the file stays byte-compatible with old runs).
-        _temp = (2.0 * ekin) / (3.0 * self.full_natoms * units.kB) if self.full_natoms else 0.0
+        _temp = (2.0 * ekin) / (3.0 * self.global_natoms * units.kB) if self.global_natoms else 0.0
         qtb_info = self._qtb_info_dict(_temp) if stage == "md" else {}
         self.trajectory.write(
             positions=pos, velocities=vel, cell=cell,
@@ -621,6 +751,10 @@ class ASERunner:
     # ------------------------------------------------------------------
     # NPT: energy-only Monte-Carlo barostat
     # ------------------------------------------------------------------
+    def _global_potential_energy(self) -> float:
+        """Total potential energy of the system (eV)."""
+        return float(self.atoms.get_potential_energy())
+
     def _build_barostat(self, temperature_K: float) -> None:
         """Construct the MC barostat and its molecule map once, before MD."""
         pos_np = self.atoms.get_positions().detach().cpu().numpy()
@@ -652,31 +786,40 @@ class ASERunner:
             mol_first_atom=mol_first,
             masses=masses,
             dlnV=self.barostat_dlnV,
+            dlnV_z=self.barostat_dlnV_z,
             seed=self.barostat_seed,
             device=self.device,
             dtype=torch.float64,
+            mode=self.barostat_mode,
         )
         V0 = float(torch.det(cell_t).abs().item())
         logger.info(
             f"[barostat] NPT enabled: P={self.pressure_bar} bar, T={temperature_K} K, "
-            f"interval={self.barostat_interval} steps, dlnV={self.barostat_dlnV}; "
+            f"interval={self.barostat_interval} steps, dlnV={self.barostat_dlnV}, "
+            f"mode={self.barostat_mode}"
+            f"{f', dlnV_z={self.barostat.dlnV_z:g}' if self.barostat_mode == 'semiiso' else ''}"
+            f"{' (xy/z decoupled, tensionless membrane)' if self.barostat_mode == 'semiiso' else ' (all axes scale together)'}; "
             f"V0={V0:.1f} A^3, rho0={self._total_mass_amu * 1.66053907 / V0:.4f} g/cm^3."
         )
 
     def _mc_barostat_attempt(self) -> bool:
-        """One isotropic MC volume move. Returns whether the move was accepted."""
+        """One MC volume move. Returns whether the move was accepted."""
         baro = self.barostat
         cell_old = self.atoms.get_cell().clone()
         V_old = float(torch.det(cell_old).abs().item())
 
-        delta, u = baro.propose()
-        s = math.exp(delta / 3.0)
+        # `kind` selects the semi-isotropic move type (area vs thickness) and is
+        # always 0 in isotropic mode; the scale vector is rebuilt from
+        # (delta, kind).
+        delta, u, kind = baro.propose_move()
+        s = baro.scale_vector(delta, kind)          # (sx, sy, sz); product = exp(delta)
+        s_cell = torch.tensor(s, device=cell_old.device, dtype=cell_old.dtype)
         V_new = V_old * math.exp(delta)
 
         E_old = float(self.atoms.get_potential_energy())
         pos_old = self.atoms.get_positions().clone()
         new_pos = baro.scale_positions(pos_old, s, cell_old)
-        self.atoms.set_cell(cell_old * s, scale_atoms=False)
+        self.atoms.set_cell(cell_old * s_cell, scale_atoms=False)
         self.atoms.set_positions(new_pos)
         E_new = float(self.atoms.get_potential_energy())
         accepted = baro.accept(E_new - E_old, V_old, V_new, u)
@@ -688,7 +831,7 @@ class ASERunner:
         return accepted
 
     def close(self):
-        """Release runner state."""
+        """Release local state."""
         self._close_trajectory()
 
     def _log_step(self, step: int, interval_time: float, total_elapsed: float, task_name: str):
@@ -697,18 +840,18 @@ class ASERunner:
             m = self._metrics_cache
             epot, ekin, fmax, etot = m["epot"], m["ekin"], m["fmax"], m["etot"]
         else:
-            # Fallback: recompute if we skipped the _save_frame step
-            epot, ekin = float(self.atoms.get_potential_energy()), float(self.atoms.get_kinetic_energy())
+            epot = float(self.atoms.get_potential_energy())
+            ekin = float(self.atoms.get_kinetic_energy())
             force = self.atoms.get_forces()
             fmax = float(torch.norm(force, dim=1).max().item()) if len(self.atoms) > 0 else 0.0
             etot = epot + ekin
 
-        temp = (2.0 * ekin) / (3.0 * self.full_natoms * units.kB)
+        temp = (2.0 * ekin) / (3.0 * self.global_natoms * units.kB)
         step_time = (interval_time / self.log_interval) * 1000 if step > 0 else 0
         log_data = {
             f"{task_name.upper()}/step": step, f"{task_name.upper()}/potential_energy": epot,
             f"{task_name.upper()}/total_energy": etot, f"{task_name.upper()}/temperature": temp,
-            f"{task_name.upper()}/fmax": fmax, f"{task_name.upper()}/step_time_ms": step_time,
+            f"{task_name.upper()}/fmax_global": fmax, f"{task_name.upper()}/step_time_ms": step_time,
         }
         baro_suffix = ""
         if self.barostat is not None:
@@ -720,9 +863,9 @@ class ASERunner:
             log_data[f"{task_name.upper()}/baro_accept_ratio"] = acc
             baro_suffix = f" | V: {V:9.1f} A^3 | rho: {density:6.4f} g/cm^3 | acc: {acc:5.2f}"
 
-        # QTB NQE diagnostics. Per-element kinetic energy is the primary NQE
-        # signal: light atoms (H) gain large zero-point energy, heavy atoms (O)
-        # stay near classical 3/2 kT. NOTE: the equipartition "temperature"
+        # QTB NQE diagnostics (single-GPU only). Per-element kinetic energy is the
+        # primary NQE signal: light atoms (H) gain large zero-point energy, heavy
+        # atoms (O) stay near classical 3/2 kT. NOTE: the equipartition "temperature"
         # above is ARTIFICIALLY HIGH under quantum QTB (the excess is zero-point, not
         # thermal) — judge NQE by these per-element KEs vs the classical TARGET, not T.
         qtb_suffix = ""
@@ -737,10 +880,7 @@ class ASERunner:
 
     def relax(self, fmax: float = 0.05, steps: int = 500, do_resume: bool = True,
               maxstep: float = 0.2, damping: float = 1.0):
-        """Structure optimization using GPU-native L-BFGS.
-
-        Note: ``full_sync_interval`` only controls how often we write frames
-        and log metrics.
+        """Structure optimization using GPU L-BFGS.
 
         Args:
             fmax: Force convergence threshold (eV/Å).
@@ -768,7 +908,7 @@ class ASERunner:
 
             step = 0
             for _ in range(steps - self.step_offset):
-                if self._has_atoms:
+                if self._should_participate_in_steps():
                     opt.step()
 
                 self._metrics_cache = None  # Bust cache for next step
@@ -784,15 +924,15 @@ class ASERunner:
                     interval_start = now
 
             if (not self._stop_requested
-                    and step > 0
-                    and step % self.full_sync_interval != 0):
-                self._save_frame(step=self.step_offset + step, stage="relax")
+                    and _needs_terminal_frame_save(
+                        self.step_offset, steps, self.global_sync_interval)):
+                self._save_frame(step=steps, stage="relax")
         finally:
             self._close_trajectory()
 
     def run_md(self, steps: int = 1000, timestep_fs: float = None, temperature_K: float = 300.0,
                friction: Optional[float] = None, do_resume: bool = True):
-        """GPU-native Langevin / QTB MD.
+        """Langevin / NVE / NPT molecular dynamics.
 
         When *do_resume* is True, the atom source is resolved as follows:
           1. If a previous MD trajectory exists, resume from it.
@@ -844,7 +984,7 @@ class ASERunner:
                     adaptive=self.qtb_adaptive,
                     adqtb_lr=self.qtb_adqtb_lr,
                     classical=self.qtb_classical,
-                ) if self._has_atoms else None
+                ) if self._has_local_atoms else None
             else:
                 dyn = TorchLangevin(
                     self.atoms,
@@ -853,7 +993,7 @@ class ASERunner:
                     friction=friction / units.fs,
                     fixcm=self.fixcm,
                     rng=rng,
-                ) if self._has_atoms else None
+                ) if self._has_local_atoms else None
 
             self.dyn = dyn
 
@@ -883,8 +1023,8 @@ class ASERunner:
                 self._metrics_cache = None
                 total_step = self.step_offset + i
 
-                # NPT: attempt an isotropic MC volume move. Placed before
-                # save/log so the recorded frame reflects the post-move box.
+                # NPT: attempt an MC volume move. Placed before save/log so the
+                # recorded frame reflects the post-move box.
                 if self.barostat is not None and (total_step % self.barostat_interval == 0):
                     self._mc_barostat_attempt()
                 if self._should_save_step(total_step) or self._stop_requested:
@@ -900,8 +1040,8 @@ class ASERunner:
                     interval_start = now
 
             if (not self._stop_requested
-                    and (steps - self.step_offset) > 0
-                    and (steps - self.step_offset) % self.full_sync_interval != 0):
+                    and _needs_terminal_frame_save(
+                        self.step_offset, steps, self.global_sync_interval)):
                 self._save_frame(step=steps)
 
             # Performance summary

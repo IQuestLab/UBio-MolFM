@@ -612,13 +612,20 @@ def _make_row_ptr_from_sorted_index(sorted_index, num_rows):
     return row_ptr
 
 
-def _prepare_segment_metadata(row_index, col_index, num_rows):
+def _prepare_segment_metadata(row_index, col_index, num_rows, is_sorted=None):
     if row_index.numel() == 0:
         empty = torch.empty((0,), device=row_index.device, dtype=torch.int32)
         row_ptr = torch.zeros((num_rows + 1,), device=row_index.device, dtype=torch.int32)
         return row_ptr, empty, empty
 
-    if _edge_index_is_sorted(row_index):
+    # ``is_sorted`` lets a caller that already KNOWS the row ordering skip the
+    # _edge_index_is_sorted() probe, whose .item() forces a host-device sync (and
+    # a torch.compile graph break). None = legacy behaviour (probe on GPU);
+    # True = rows are ascending (use identity perm); False = always argsort.
+    if is_sorted is None:
+        is_sorted = _edge_index_is_sorted(row_index)
+
+    if is_sorted:
         edge_perm = torch.arange(row_index.numel(), device=row_index.device, dtype=torch.int32)
         sorted_row_index = row_index
         sorted_col_index = col_index
@@ -632,15 +639,16 @@ def _prepare_segment_metadata(row_index, col_index, num_rows):
     return row_ptr, sorted_col_index.contiguous(), edge_perm.contiguous()
 
 
-def prepare_sparse_qk_edge_index_metadata(query_index, neighbor_index, num_queries, num_keys):
+def prepare_sparse_qk_edge_index_metadata(query_index, neighbor_index, num_queries, num_keys,
+                                          query_sorted=None, neighbor_sorted=None):
     query_index_i32 = query_index.contiguous().to(torch.int32)
     neighbor_index_i32 = neighbor_index.contiguous().to(torch.int32)
 
     q_row_ptr, q_col_index, q_alpha_index = _prepare_segment_metadata(
-        query_index_i32, neighbor_index_i32, num_queries
+        query_index_i32, neighbor_index_i32, num_queries, is_sorted=query_sorted,
     )
     key_row_ptr, key_col_index, key_alpha_index = _prepare_segment_metadata(
-        neighbor_index_i32, query_index_i32, num_keys
+        neighbor_index_i32, query_index_i32, num_keys, is_sorted=neighbor_sorted,
     )
     return (
         q_row_ptr,

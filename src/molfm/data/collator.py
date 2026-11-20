@@ -10,16 +10,15 @@ import torch.nn.functional as F
 from loguru import logger
 from torch.utils.data import ConcatDataset, DataLoader, Sampler
 
-from .dataset import MoleculeLMDBDataset, TOYxyzDataset, SPICExyzDataset
-
-_register_keys = set([])
+from .dataset import MoleculeLMDBDataset, SPICExyzDataset
 
 special_pad_keys = {
     "pos": lambda x, pad_len: F.pad(x, (0, 0, 0, pad_len)),
     "atomic_numbers": lambda x, pad_len: F.pad(x, (0, pad_len)),
     "fixed": lambda x, pad_len: F.pad(x, (0, pad_len)),
-    "cos": lambda x, pad_len: F.pad(x, (0, pad_len)),
     "forces": lambda x, pad_len: F.pad(x, (0, 0, 0, pad_len)),
+    # (N,) bool; the pad value is False.
+    "hoh_o_mask": lambda x, pad_len: F.pad(x, (0, pad_len)),
 }
 
 def collate_fn(batch):
@@ -345,6 +344,13 @@ def get_dataloader(args):
     remove_atomref_energy = (
         args.remove_atomref_energy if hasattr(args, "remove_atomref_energy") else True
     )
+    # Routes water oxygens through the mixed-resolution LIGHT branch. Every dataset class
+    # that can emit a hoh_o_mask needs it, so resolve it once here.
+    lf_O_in_HOH = bool(getattr(args, "lf_O_in_HOH", False))
+    # DataLoader background workers per rank. See _loader_worker_kwargs for why this is
+    # not 0 any more. getattr keeps older configs / checkpointed args objects working.
+    num_workers = int(getattr(args, "num_workers", 0) or 0)
+    logger.info(f"dataloader num_workers per rank: {num_workers}")
 
     file_list = []
     file_list_valid = []
@@ -355,16 +361,27 @@ def get_dataloader(args):
         args.dataset_micro_batch_size = args.dataset_micro_batch_size[5:]
     dataset_micro_batch_size = [int(i) for i in args.dataset_micro_batch_size.split(",")]
     dataset_sample_prob = [float(i) for i in args.dataset_sample_prob.split(",")]
+    # A branch's own field may itself list several directories joined by "+" (e.g.
+    # "omol25/train_shard_a+omol25/train_shard_b") to merge them into ONE dataset/one
+    # data_name -- "," still separates BRANCHES, so it must stay the outer split.
+    # MoleculeLMDBDataset already accepts a list of paths (dataset.py __init__), so a
+    # "+"-joined field is passed through as a list instead of a single string.
     for sub_data_path in args.data_path_list.split(","):
-        file_list.append(os.path.join(args.data_path, sub_data_path))
+        parts = sub_data_path.split("+")
+        if len(parts) == 1:
+            file_list.append(os.path.join(args.data_path, parts[0]))
+        else:
+            file_list.append([os.path.join(args.data_path, p) for p in parts])
     
     if args.data_path_list_valid=="" or args.data_path_list_valid.lower()=="none":
         file_list_valid = ["" for _ in range(len(file_list))]
     else:
         for sub_data_path in args.data_path_list_valid.split(","):
-            file_list_valid.append(
-                os.path.join(args.data_path, sub_data_path)
-            )
+            parts = sub_data_path.split("+")
+            if len(parts) == 1:
+                file_list_valid.append(os.path.join(args.data_path, parts[0]))
+            else:
+                file_list_valid.append([os.path.join(args.data_path, p) for p in parts])
           
     assert (
             len(dataset_sample_prob) == len(dataset_name_list) and 
@@ -384,15 +401,15 @@ def get_dataloader(args):
         file_list, file_list_valid, dataset_name_list
     ):  
         if dataset_name in ["spice"]:
-            train_dataset = SPICExyzDataset( data_path)
+            if isinstance(data_path, list) or isinstance(data_path_valid, list):
+                raise ValueError(
+                    "SPICE xyz datasets read a single file; a '+' joined "
+                    "data_path_list entry is only supported by the LMDB datasets "
+                    f"(got {data_path!r})."
+                )
+            train_dataset = SPICExyzDataset( data_path, lf_O_in_HOH=lf_O_in_HOH)
             if data_path_valid == "":data_path_valid=data_path
-            valid_dataset = SPICExyzDataset( data_path_valid)
-            train_dataset_list.append(train_dataset)
-            valid_dataset_list.append(valid_dataset)
-            train_len += len(train_dataset)
-            valid_len += len(valid_dataset)
-        elif dataset_name in ["toy"]:
-            train_dataset,valid_dataset = TOYxyzDataset(""),TOYxyzDataset("")
+            valid_dataset = SPICExyzDataset( data_path_valid, lf_O_in_HOH=lf_O_in_HOH)
             train_dataset_list.append(train_dataset)
             valid_dataset_list.append(valid_dataset)
             train_len += len(train_dataset)
@@ -402,6 +419,7 @@ def get_dataloader(args):
                 data_path,
                 data_name=dataset_name,
                 remove_atomref_energy=remove_atomref_energy,
+                lf_O_in_HOH=lf_O_in_HOH,
             )
             if data_path_valid:
                 # TODO: test dataset
@@ -410,6 +428,7 @@ def get_dataloader(args):
                     data_path_valid,
                     data_name=dataset_name,
                     remove_atomref_energy=remove_atomref_energy,
+                    lf_O_in_HOH=lf_O_in_HOH,
                 )
             else:
                 shuffle = args.shuffle
@@ -441,8 +460,8 @@ def get_dataloader(args):
             raise ValueError(f"sorry ,dataset can not find atom cnts:{[d.atom_cnts.any() for d in train_dataset_list]}, thus atom level dataloaer issue happened")
         train_atom_cnts = [d.atom_cnts for d in train_dataset_list]
         valid_atom_cnts = [d.atom_cnts for d in valid_dataset_list]
-        train_dataloader = make_atomloader_default(train_dataset_final,train_atom_cnts,dataset_micro_batch_size,dataset_sample_prob,True)
-        valid_dataloader = make_atomloader_default(valid_dataset_final,valid_atom_cnts,dataset_micro_batch_size,dataset_sample_prob,False)
+        train_dataloader = make_atomloader_default(train_dataset_final,train_atom_cnts,dataset_micro_batch_size,dataset_sample_prob,True,num_workers=num_workers)
+        valid_dataloader = make_atomloader_default(valid_dataset_final,valid_atom_cnts,dataset_micro_batch_size,dataset_sample_prob,False,num_workers=num_workers)
         logger.info(f"train dataset atom cnts:{train_atom_cnts}")
 
     else:
@@ -450,14 +469,51 @@ def get_dataloader(args):
         valid_dataset_final = ConcatDataset(valid_dataset_list)
         train_dataset_lengths = [len(d) for d in train_dataset_list]
         valid_dataset_lengths = [len(d) for d in valid_dataset_list]
-        train_dataloader = make_loader_default(train_dataset_final,train_dataset_lengths,dataset_micro_batch_size,dataset_sample_prob,True)
-        valid_dataloader = make_loader_default(valid_dataset_final,valid_dataset_lengths,dataset_micro_batch_size,dataset_sample_prob,False)
+        train_dataloader = make_loader_default(train_dataset_final,train_dataset_lengths,dataset_micro_batch_size,dataset_sample_prob,True,num_workers=num_workers)
+        valid_dataloader = make_loader_default(valid_dataset_final,valid_dataset_lengths,dataset_micro_batch_size,dataset_sample_prob,False,num_workers=num_workers)
             
         logger.info(f"is_distributed: {is_distributed}. train_dataloader {len(train_dataloader)}. valid_dataloader {len(valid_dataloader)}")
     return train_dataloader, valid_dataloader, None
 
 
-def make_atomloader_default(dataset:ConcatDataset,lengths,micro_batch_size,dataset_sample_prob, is_train=True):
+def _loader_worker_kwargs(num_workers):
+    """Extra DataLoader kwargs for background loading.
+
+    num_workers=0 (the previous hard-coded behaviour) puts every LMDB read on the
+    training step's critical path. That is invisible on a small dataset that the page
+    cache can hold, but on a large multi-shard LMDB dataset with random access over a
+    network filesystem it dominates: measured 1933 ms/batch at 0 workers vs 172
+    (2), 76 (4), 35 (8). See also the int64 self._keys change in dataset.py, which is
+    what keeps the fork()ed workers from copy-on-writing the id store.
+
+    Fork-safety: ase_db_backends.aselmdb.LMDBDatabase exposes `env` as a property that
+    reopens the LMDB environment whenever os.getpid() differs from the pid it was opened
+    under, and opens read-only with lock=False (no shared reader table), so each worker
+    transparently gets its own handle. The plain-.lmdb branch of open_db uses the same
+    readonly/lock=False flags.
+    """
+    num_workers = int(num_workers or 0)
+    if num_workers <= 0:
+        return {}
+    return dict(
+        num_workers=num_workers,
+        prefetch_factor=4,
+        # Keep the workers (and their reopened LMDB envs) alive across epochs; the
+        # sampler yields hundreds of thousands of batches per epoch, so respawning
+        # would also mean re-paying the env reopen.
+        persistent_workers=True,
+        # MUST be fork: under spawn the DataLoader pickles the dataset to reach each worker
+        # -> `TypeError: cannot pickle 'Environment' object`, because the dataset holds open
+        # LMDB envs. Under fork nothing is pickled: the envs are inherited and the aselmdb
+        # backend's `env` property reopens them per pid on first use. The workers are
+        # CPU-only (neither collate_fn nor the dataset touches CUDA), which is what makes
+        # forking a CUDA-initialised parent safe here.
+        #
+        multiprocessing_context="fork",
+    )
+
+
+def make_atomloader_default(dataset:ConcatDataset,lengths,micro_batch_size,dataset_sample_prob, is_train=True, num_workers=0):
     if len(lengths)!=len(micro_batch_size):raise
     if torch.distributed.is_initialized():
         batch_sampler = MultiDatasetTokenBatchDistributedSampler( lengths, micro_batch_size,dataset_sample_prob,shuffle=is_train)
@@ -470,12 +526,12 @@ def make_atomloader_default(dataset:ConcatDataset,lengths,micro_batch_size,datas
         dataset,
         batch_sampler=batch_sampler,
         collate_fn=collate_fn,
-        
+        **_loader_worker_kwargs(num_workers),
     )
     return loader
 
 
-def make_loader_default(dataset,dataset_lengths,micro_batch_size,dataset_sample_prob, is_train):
+def make_loader_default(dataset,dataset_lengths,micro_batch_size,dataset_sample_prob, is_train, num_workers=0):
     if torch.distributed.is_initialized():
         batch_sampler = MultiDatasetFixedBatchDistributedSampler(dataset_lengths, micro_batch_size,dataset_sample_prob,shuffle=is_train)
     else:
@@ -489,6 +545,6 @@ def make_loader_default(dataset,dataset_lengths,micro_batch_size,dataset_sample_
         # sampler=sampler,
         batch_sampler=batch_sampler,
         collate_fn=collate_fn,
-        
+        **_loader_worker_kwargs(num_workers),
     )
     return loader

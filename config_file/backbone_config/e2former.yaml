@@ -1,4 +1,7 @@
 name: e2former
+
+
+# dit_config
 encoder_embed_dim: 1024
 ffn_embedding_dim: 1536
 num_attention_heads: 32
@@ -25,6 +28,32 @@ norm_layer: 'rms_norm_sh'
 attn_type: 'so2-first-order'
 tp_type: 'QK_alpha+triton'
 edge_embedtype: 'default'
+
 ffn_type: 's3'
 encoder: "default" # or dit
 with_cluster: false
+
+# --- Mixed-resolution additions ----------------------------------------------
+ffn_hidden_multiplier: 1
+ffn_grid_resolution: 18
+
+layerwise_shared_KV_cache: false
+normalized_radial_profile: true
+
+mixed_resolution:
+  enabled: False
+  irreps_light_embedding: "32x0e"
+  lf_atoms: [1]
+  light_attn_heads: 4
+  light_attn_scalar_head: 8
+  light_ffn_grid_resolution: null
+  cross_mode: "interleaved"          # "interleaved" | "interleaved_flash"
+  cross_mode_list: null
+  interleaved_tail: "v1"             # "interleaved" ONLY (IGNORED by "interleaved_flash", which owns its read-out)
+  flash_up_proj: "linear"            # "interleaved_flash" ONLY: how the light state becomes the light half of an A2H-flash KV bank. "linear" = SO3_Linear C_L->C_H at lmax_light, zero-padded to (lmax+1)^2; valid below lmax_light == lmax because the first-order value path raises a KV row's orders by one per block (asserted against attn_type). "tp" = the A2LUpProjection edge tensor product (per-edge radial trunk + Clebsch-Gordan), used when the lift's output is the persistent state
+  a2h_kv_union: True                 # restrict each All2Heavy block's K/V/source-embedding projection to the heavy-neighbour union instead of all atoms (algebraically lossless, not bit-exact). Env override: MOLFM_MR_A2H_KV_UNION=0|1
+  a2h_kv_union_max_ratio: 0.9        # skip a2h_kv_union when the union exceeds this fraction of the atoms. Gated on the TRUE union size, not the heavy fraction; near 100% the compression is a plain copy that saves nothing
+  light_angular_basis: 8
+  light_angular_zeta_cnt: 4
+  light_angular_eta: 1.0
+  energy_head: "standard"            # "standard" | "distinct" -- "distinct" gives light atoms their own energy head. Required (asserted) under cross_mode="interleaved_flash", whose read-out leaves the heavy irreps tensor's light rows structurally zero. The direct force head (AutoGradForce=False) is handled the same way automatically via force_heads_light and is_light_2d

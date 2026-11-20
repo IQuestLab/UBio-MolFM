@@ -40,8 +40,7 @@ if [ -n "${swanlab_key}" ] && command -v swanlab >/dev/null 2>&1; then
   swanlab login -k "$swanlab_key"
 fi
 
-[ -z "${launcher}" ] && launcher='openmpi'
-[ -z "${hostfile}" ] && hostfile="${PROJECT_ROOT}/job/hostfile"
+# torchrun is used directly; no hostfile is required.
 [ -z "${MASTER_PORT}" ] && MASTER_PORT=62362
 [ -z "${MASTER_ADDR}" ] && MASTER_ADDR=127.0.0.1
 [ -z "${NNODES}" ] && NNODES=1

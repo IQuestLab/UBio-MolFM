@@ -1,10 +1,3 @@
-# Description: Fully GPU-driven Langevin MD integrator for TorchAtoms.
-# Features: Ping-Pong buffering, CUDA Graphs support, Zero-allocation step loop.
-# Deterministic (friction==0) fast path. With fr=0 the Vanden-Eijnden-Ciccotti
-# coefficients collapse to c1=dt/2, c2=0, sigma=0 -> the scheme is exactly
-# velocity-Verlet (NVE). In that mode the per-step RNG draw and noise
-# projection are skipped (perturbations are identically zero), so ensemble='nve'
-# reuses this integrator with no wasted work.
 
 import warnings
 
@@ -117,6 +110,10 @@ class TorchLangevin(MolecularDynamics):
         from molfm.interface.ase.torch_ext.torch_atoms import TorchAtoms
         if not isinstance(atoms, TorchAtoms):
             raise TypeError(f"TorchLangevin requires a TorchAtoms instance, got {type(atoms).__name__}")
+
+        if "communicator" in kwargs:
+            warnings.warn("`communicator` is deprecated. Use `comm`.", FutureWarning)
+            kwargs["comm"] = kwargs.pop("communicator")
 
         if friction is None:
             raise TypeError("Missing required 'friction' argument.")

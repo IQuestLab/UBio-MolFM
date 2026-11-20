@@ -22,7 +22,6 @@ from e3nn.util.jit import compile_mode
 from e3nn.o3 import FromS2Grid, ToS2Grid
 
 
-from molfm.models.e2former.maceblocks import NonLinearDipoleReadoutBlock
 from .triton_dr.triton_sparse_qk_autograd import prepare_sparse_qk_edge_index_metadata
 
 
@@ -36,19 +35,11 @@ import torch, torch.nn as nn, re
 from torch.optim import AdamW, Adam
 
 import torch.nn as nn
-from typing import Optional
-
 def build_param_groups(
     model: nn.Module,
     base_lr: float,
     weight_decay: float,
-    custom_factors: Optional[list[tuple[str, float]]] = None,
 ):
-    """
-    custom_factors: 
-        e.g. [("svp", 10.0), ("tzvpd", 30.0)]
-
-    """
     model = model.module if hasattr(model, "module") else model
 
     no_decay_types = (
@@ -75,8 +66,8 @@ def build_param_groups(
             return True
         return False
 
-    # key: ("decay" or "no_decay", lr_mult) -> [params...]
-    groups: dict[tuple[str, float], list] = {}
+    # key: "decay" or "no_decay" -> [params...]
+    groups: dict[str, list] = {}
 
     for mod_name, module in model.named_modules():
         for p_name, p in module.named_parameters(recurse=False):
@@ -86,29 +77,18 @@ def build_param_groups(
             full = f"{mod_name}.{p_name}" if mod_name else p_name
             nd = is_no_decay(full, module, p)
 
-            
-            lr_mult = 1.0
-            
-            if custom_factors is not None:
-                for key_substr, factor in custom_factors:
-                    if key_substr in full:
-                        lr_mult = float(factor)
-                        break
-
             kind = "no_decay" if nd else "decay"
-            gkey = (kind, lr_mult)
-            groups.setdefault(gkey, []).append(p)
+            groups.setdefault(kind, []).append(p)
 
-    
     param_groups = []
-    for (kind, lr_mult), params in groups.items():
+    for kind, params in groups.items():
         if not params:
             continue
         wd = 0.0 if kind == "no_decay" else weight_decay
         param_groups.append(
             {
                 "params": params,
-                "lr": base_lr * lr_mult,
+                "lr": base_lr,
                 "weight_decay": wd,
             }
         )
@@ -178,47 +158,52 @@ class sph_fromxyz(torch.nn.Module):
 
 # follow fairchem 2.4.0 and e3nn 0.4.0
 # quick fix: for some special case e.g. [0,0,0],[0,1,0],[0,x,0]
-@torch.compiler.disable
-def init_edge_rot_euler_angles(edge_distance_vec,training = True,ts = 0.00001):
+def init_edge_rot_euler_angles(edge_distance_vec, training=True, ts=0.00001, debug=False):
     edge_vec_0 = edge_distance_vec
-    edge_vec_0_distance = torch.norm(edge_vec_0,dim = 1) #torch.sqrt(torch.sum(edge_vec_0**2, dim=1))
+    edge_vec_0_distance = torch.norm(edge_vec_0, dim=1)  # torch.sqrt(torch.sum(edge_vec_0**2, dim=1))
 
-    # Make sure the atoms are far enough apart
-    # assert torch.min(edge_vec_0_distance) < 0.0001
-    mask = edge_vec_0_distance < ts
-    if len(edge_vec_0_distance) > 0 and torch.min(edge_vec_0_distance) < ts:
-        logger.error(f"Error edge_vec_0_distance: {torch.min(edge_vec_0_distance)} - > reset to 1")
-        edge_vec_0_distance = torch.where(
-            edge_vec_0_distance < ts,
-            1,
-            edge_vec_0_distance
-        )
-    #     mask = 
-    # else:
-    #     # are we standing at the north pole
-    #     mask = xyz[:, 1].abs().isclose(xyz.new_ones(1))
+    # degenerate edges (zero / near-zero length): treated like the original "reset to 1"
+    dist_mask = edge_vec_0_distance < ts
+    if debug:
+        # data-dependent host sync + log; only when explicitly debugging, kept out
+        # of the compiled / hot path (mirrors the old `if min<ts: logger.error`).
+        if len(edge_vec_0_distance) > 0 and torch.min(edge_vec_0_distance) < ts:
+            logger.error(
+                f"Error edge_vec_0_distance: {torch.min(edge_vec_0_distance)} - > reset to 1"
+            )
+
+    # graph-safe div-by-zero guard (replaces the data-dependent python `if ... reset`,
+    # so there is no host sync and the op fuses under torch.compile)
+    safe_distance = torch.where(
+        dist_mask, torch.ones_like(edge_vec_0_distance), edge_vec_0_distance
+    )
 
     # make unit vectors
-    xyz = edge_vec_0 / (edge_vec_0_distance.view(-1, 1))
-    mask = mask + xyz[:, 1].abs().isclose(xyz.new_ones(1))
+    xyz = edge_vec_0 / (safe_distance.view(-1, 1))
+    # also mask the poles (y ~= +-1) where acos'/atan2' are singular
+    mask = dist_mask | xyz[:, 1].abs().isclose(xyz.new_ones(1))
 
-    # compute alpha and beta
+    # compute alpha and beta via double masking (double-where):
+    #   1st where sanitizes the *inputs* so acos'/atan2' stay finite on the
+    #     differentiable branch (avoids the classic 0*inf=NaN gradient);
+    #   2nd where keeps the real (detached) value at degenerate positions and the
+    #     differentiable value elsewhere -> bit-identical to the boolean-index form.
+    y, x, z = xyz[:, 1], xyz[:, 0], xyz[:, 2]
+    safe_y = torch.where(mask, torch.zeros_like(y), y)
+    safe_x = torch.where(mask, torch.ones_like(x), x)
+    safe_z = torch.where(mask, torch.ones_like(z), z)
 
     # latitude (beta)
-    beta = xyz.new_zeros(xyz.shape[0])
-    beta[~mask] = torch.acos(xyz[~mask, 1])
-    beta[mask] = torch.acos(xyz[mask, 1]).detach()
-
+    beta = torch.where(mask, torch.acos(y).detach(), torch.acos(safe_y))
     # longitude (alpha)
-    alpha = torch.zeros_like(beta)
-    alpha[~mask] = torch.atan2(xyz[~mask, 0], xyz[~mask, 2])
-    alpha[mask] = torch.atan2(xyz[mask, 0], xyz[mask, 2]).detach()
+    alpha = torch.where(mask, torch.atan2(x, z).detach(), torch.atan2(safe_x, safe_z))
+
     if training:
         # random gamma (roll)
         gamma = torch.rand_like(alpha) * 2 * torch.pi
         # gamma = torch.zeros_like(alpha)
     else:
-        gamma = torch.zeros_like(alpha) #* 2 * torch.pi
+        gamma = torch.zeros_like(alpha)  # * 2 * torch.pi
 
     # intrinsic to extrinsic swap
     return -gamma, -beta, -alpha
@@ -1864,9 +1849,11 @@ class GaussianSmearing(torch.nn.Module):
 
     def forward(self, dist) -> torch.Tensor:
         shape = dist.shape
+        if dist.numel() == 0:
+            return dist.new_zeros(*shape, self.offset.shape[0])
         dist = dist.view(-1, 1) - self.offset.view(1, -1)
         dist = torch.exp(self.coeff * torch.pow(dist, 2))
-        return dist.reshape(*shape, -1)
+        return dist.reshape(*shape, self.offset.shape[0])
 
 
 # gaussian layer with edge type (i,j)
@@ -3059,7 +3046,6 @@ class Electron_Density_Descriptor(torch.nn.Module):
             fibonacci_sphere(num_sphere_points), requires_grad=False
         )
 
-        logger.debug("gama shape={} sphere_grid shape={}", self.gama.shape, self.sphere_grid.shape)
         theta, phi = cartesian_to_spherical(self.sphere_grid)
         self.Y_lm_conj = []
         for l in range(lmax + 1):
@@ -3209,11 +3195,15 @@ def construct_radius_neighbor(node_pos,node_mask,
         f_attn_mask_tmp = f_attn_mask.squeeze(dim=-1)
         a1 = torch.norm(f_edge_vec,dim = -1)[~f_attn_mask_tmp]-f_dist[~f_attn_mask_tmp]
         if torch.max(a1)!=0:
-            logger.error("Please verify your code, neighbor selection error happened")
+            logger.error("Neighbor selection error: edge lengths and distances disagree")
         if torch.sum(node_pos[~node_mask]==0):
-            logger.warning("node padding part is zero, will lead to some neighbor dist sort error")
+            logger.warning(
+                "Node padding part is zero, will lead to some neighbor dist sort error"
+            )
         if torch.sum(expand_node_pos[~expand_node_mask]==0):
-            logger.warning("expand_node_pos padding part is zero, will lead to some neighbor dist sort error")
+            logger.warning(
+                "expand_node_pos padding part is zero, will lead to some neighbor dist sort error"
+            )
     N, K = f_sparse_idx_expnode.shape
     device = f_sparse_idx_expnode.device
 
@@ -3240,3 +3230,105 @@ def construct_radius_neighbor(node_pos,node_mask,
         "f_dist": f_dist[valid_mask].contiguous(),
         "f_poly_dist": f_poly_dist[valid_mask].contiguous(),
     }
+
+
+class SwiGLU_S2Activation(torch.nn.Module):
+    """
+    SwiGLU-S^2 activation: sigmoid(x_scalar) * x1_grid ⊙ x2_grid
+
+    Strictly equivariant: nonlinearity only touches the scalar gate, while
+    higher-order grid features interact via bilinear (elementwise) multiplication.
+
+    Args:
+        lmax (int): Maximum spherical harmonic degree.
+        grid_resolution (int): Number of grid points per axis.
+    """
+
+    def __init__(self, lmax: int, grid_resolution: int = 18):
+        super().__init__()
+        self.lmax = lmax
+        self.so3_grid = SO3_Grid(lmax, lmax, resolution=grid_resolution)
+        self.sigmoid = torch.nn.Sigmoid()
+
+    def forward(
+        self,
+        x_scalar: torch.Tensor,       # [N, 1, C]  scalar irreps features
+        x1_grid: torch.Tensor,         # [N, R_phi, R_theta, C]
+        x2_grid: torch.Tensor,         # [N, R_phi, R_theta, C]
+    ) -> torch.Tensor:
+        gate = self.sigmoid(x_scalar)  # [N, 1, C]
+        z_grid = x1_grid * x2_grid     # elementwise on sphere == fast tensor product
+        z = self.so3_grid.from_grid(z_grid, self.lmax, self.lmax)  # [N, (L+1)^2, C]
+        # apply scalar gate (broadcast over spherical-harmonic dimension)
+        z = gate * z
+        return z
+
+
+class FeedForwardNetwork_swiglu_s2(torch.nn.Module):
+    """
+    FFN using SwiGLU-S^2 activation.
+
+    Architecture:
+      1. SO3_Linear: sphere_channels -> 2 * hidden_channels  (two grid branches)
+      2. SO3_Linear: sphere_channels -> hidden_channels       (scalar gate branch)
+      3. Project both branches to grid
+      4. SwiGLU-S^2: sigmoid(scalar_gate) * grid1 ⊙ grid2
+      5. SO3_Linear: hidden_channels -> output_channels
+
+    Args:
+        sphere_channels (int): Input/output channel count.
+        hidden_channels (int): Width of hidden representation.
+        output_channels (int): Output channel count.
+        lmax (int): Maximum spherical harmonic degree.
+        grid_resolution (int): Grid resolution for S^2 projection.
+    """
+
+    def __init__(
+        self,
+        sphere_channels: int,
+        hidden_channels: int,
+        output_channels: int,
+        lmax: int,
+        grid_resolution: int = 18,
+    ):
+        super().__init__()
+        self.lmax = lmax
+        self.so3_grid = SO3_Grid(lmax, lmax, resolution=grid_resolution)
+
+        # Project input irreps to two hidden branches (for grid1 and grid2)
+        self.so3_linear_kv = SO3_Linear_e2former(
+            sphere_channels, 2 * hidden_channels, lmax=lmax, bias=True
+        )
+        # Scalar gate branch: only the l=0 component is needed
+        self.scalar_gate_linear = torch.nn.Linear(sphere_channels, hidden_channels, bias=True)
+
+        self.act = SwiGLU_S2Activation(lmax, grid_resolution=grid_resolution)
+
+        self.so3_linear_out = SO3_Linear_e2former(
+            hidden_channels, output_channels, lmax=lmax, bias=True
+        )
+
+    def forward(self, node_input: torch.Tensor) -> torch.Tensor:
+        # node_input: [..., (lmax+1)^2, sphere_channels]
+        out_shape = node_input.shape[:-2]
+        N = out_shape.numel()
+        x = node_input.reshape(N, (self.lmax + 1) ** 2, -1)
+
+        # scalar gate from l=0 component: [N, 1, C]
+        x_scalar_gate = self.scalar_gate_linear(x[:, 0:1, :])  # [N, 1, hidden_channels]
+
+        # two hidden branches
+        x_kv = self.so3_linear_kv(x)  # [N, (L+1)^2, 2*hidden]
+        x1_irreps = x_kv[:, :, : x_kv.shape[-1] // 2]   # [N, (L+1)^2, hidden]
+        x2_irreps = x_kv[:, :, x_kv.shape[-1] // 2 :]   # [N, (L+1)^2, hidden]
+
+        # project to grid
+        x1_grid = self.so3_grid.to_grid(x1_irreps, self.lmax, self.lmax)  # [N, R, R, hidden]
+        x2_grid = self.so3_grid.to_grid(x2_irreps, self.lmax, self.lmax)  # [N, R, R, hidden]
+
+        # SwiGLU-S^2: back to irreps
+        z = self.act(x_scalar_gate, x1_grid, x2_grid)  # [N, (L+1)^2, hidden]
+
+        out = self.so3_linear_out(z)  # [N, (L+1)^2, output_channels]
+        return out.reshape(out_shape + ((self.lmax + 1) ** 2, -1))
+

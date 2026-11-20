@@ -7,7 +7,7 @@ export MKL_SERVICE_FORCE_INTEL=1
 export MKL_THREADING_LAYER='GNU'
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
 
 [ -z "${data_path}" ] && data_path="${PROJECT_ROOT}/data"
 [ -z "${data_path_list}" ] && data_path_list="${PROJECT_ROOT}/data/omol25/train_4M"
@@ -40,8 +40,7 @@ if [ -n "${swanlab_key}" ] && command -v swanlab >/dev/null 2>&1; then
   swanlab login -k "$swanlab_key"
 fi
 
-[ -z "${launcher}" ] && launcher='openmpi'
-[ -z "${hostfile}" ] && hostfile="${PROJECT_ROOT}/job/hostfile"
+# torchrun is used directly; no hostfile is required.
 [ -z "${MASTER_PORT}" ] && MASTER_PORT=62361
 [ -z "${MASTER_ADDR}" ] && MASTER_ADDR=127.0.0.1
 [ -z "${NNODES}" ] && NNODES=1
@@ -86,12 +85,12 @@ torchrun $DISTRIBUTED_ARGS src/molfm/tasks/pretrain_smallmol.py \
           tb=$tb \
           tb_dir=$tb_dir \
           save_dir=$save_dir \
-          ckpt_path="./outputs/ckpt_log/e2_0912_100M_8x8_4x256o2_Head128x8_bs16/checkpoint_E9_B90120.pt" \
+          ckpt_path="${ckpt_path:?set ckpt_path to the stage-1 checkpoint}" \
           clip_grad_norm=100 \
-          experiment_name=e2_0923NewValid_1x8_AutoG_F8x8E9_4x256o2_atom1024 \
+          experiment_name="${experiment_name:-e2former_v2_stage2}" \
           gradient_accumulation_steps=$gradient_accumulation_steps \
           scheduler_config=groupWarmupDecayLR \
-          scheduler_config.warmup_num_steps=10000 \
+          scheduler_config.warmup_steps=10000 \
           strategy_config=ddp \
           backbone=e2former \
           backbone_config=e2former \
@@ -102,11 +101,9 @@ torchrun $DISTRIBUTED_ARGS src/molfm/tasks/pretrain_smallmol.py \
           backbone_config.attn_scalar_head=8 \
           backbone_config.num_attn_heads=128 \
           backbone_config.number_of_basis=256 \
-          backbone_config.pbc_max_radius=4.5 \
           backbone_config.max_radius=4.5 \
           backbone_config.max_neighbors=32 \
           backbone_config.alpha_drop=0 \
-          backbone_config.drop_path_rate=0 \
           backbone_config.basis_type='gaussiansmear' \
           backbone_config.norm_layer='rms_norm_sh' \
           backbone_config.attn_type='so2-first-order' \

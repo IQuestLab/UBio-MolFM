@@ -1,0 +1,66 @@
+# Hydra backbone config for Flash.
+#
+# Training:
+#   torchrun ... src/molfm/tasks/pretrain_smallmol.py \
+#       --config-name=config_molfm.yaml backbone_config=flash \
+#       lf_O_in_HOH=True ...
+#
+# Flash routes hydrogens AND water oxygens through the light stream, so the
+# top-level training arg lf_O_in_HOH=True is required (it is not a backbone
+# key). For inference, pass --lf_o_in_hoh True instead.
+#
+# The matching flattened inference config is
+# config_file/examples/flash.yaml.
+
+name: e2former
+encoder_embed_dim: 1024
+ffn_embedding_dim: 1536
+num_attention_heads: 32
+dropout: 0.1
+num_encoder_layers: 12
+pbc_expanded_token_cutoff: 256
+pbc_expanded_num_cell_per_direction: 1
+num_layers: 6
+irreps_node_embedding: "256x0e+256x1e+256x2e"
+irreps_head: "2x0e+2x1e+2x2e"
+attn_scalar_head: 8
+num_attn_heads: 128
+number_of_basis: 256
+max_radius: 5.5
+max_neighbors: null
+alpha_drop: 0.0
+basis_type: gaussiansmear
+norm_layer: rms_norm_sh
+attn_type: zero-order
+tp_type: QK_alpha+softplus+triton
+edge_embedtype: default
+ffn_type: s2
+encoder: default
+with_cluster: false
+ffn_hidden_multiplier: 1
+ffn_grid_resolution: 12
+layerwise_shared_KV_cache: false
+normalized_radial_profile: true
+
+# Flash owns its read-out (two persistent streams); no layer concat.
+cat_layer_output: false
+cat_layer_indices: null
+
+mixed_resolution:
+  enabled: true
+  irreps_light_embedding: "32x0e+32x1e+32x2e"
+  lf_atoms: [1]
+  light_attn_heads: 16
+  light_attn_scalar_head: 4
+  light_ffn_grid_resolution: 12
+  cross_mode: interleaved_flash
+  cross_mode_list: [A2H-flash, A2H-flash, A2L-flash, A2H-flash, A2H-flash, A2L-flash]
+  interleaved_tail: v1
+  flash_up_proj: linear
+  a2h_kv_union: true
+  a2h_kv_union_max_ratio: 0.9
+  light_angular_basis: 0
+  light_angular_zeta_cnt: 4
+  light_angular_eta: 1.0
+  energy_head: distinct
+  r_cross: null

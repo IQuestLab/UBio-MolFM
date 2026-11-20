@@ -40,8 +40,7 @@ if [ -n "${swanlab_key}" ] && command -v swanlab >/dev/null 2>&1; then
   swanlab login -k "$swanlab_key"
 fi
 
-[ -z "${launcher}" ] && launcher='openmpi'
-[ -z "${hostfile}" ] && hostfile="${PROJECT_ROOT}/job/hostfile"
+# torchrun is used directly; no hostfile is required.
 [ -z "${MASTER_PORT}" ] && MASTER_PORT=62361
 [ -z "${MASTER_ADDR}" ] && MASTER_ADDR=127.0.0.1
 [ -z "${NNODES}" ] && NNODES=1
@@ -89,12 +88,12 @@ torchrun $DISTRIBUTED_ARGS src/molfm/tasks/pretrain_smallmol.py \
           log_interval=100 \
           wandb=$wandb \
           swanlab=$swanlab \
-          swanlab_project=lhuang_spice \
+          swanlab_project=molfm_spice \
           tb=$tb \
           tb_dir=$tb_dir \
           save_dir=$save_dir \
           ckpt_path="none" \
-          experiment_name=spice_0106_1x8_4S_E2e-1_woDrop_QKdot_128head_256o2 \
+          experiment_name="${experiment_name:-spice_stage1}" \
           gradient_accumulation_steps=$gradient_accumulation_steps \
           scheduler_config=groupWarmupDecayLR \
           strategy_config=ddp \

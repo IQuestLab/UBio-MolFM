@@ -22,7 +22,7 @@ def _cfgs_outer_reduce():
     return cfgs
 
 
-@triton.autotune(configs=_cfgs_outer_reduce(), key=["L", "H"])
+@triton.autotune(configs=_cfgs_outer_reduce(), key=["H"])
 @triton.jit
 def _edge_outer_reduce_kernel(
     EDGE_SH,
@@ -78,7 +78,7 @@ def _cfgs_dsh():
     return cfgs
 
 
-@triton.autotune(configs=_cfgs_dsh(), key=["L", "H"])
+@triton.autotune(configs=_cfgs_dsh(), key=["H"])
 @triton.jit
 def _edge_dsh_kernel(
     GO,
@@ -132,7 +132,7 @@ def _cfgs_dfea():
     return cfgs
 
 
-@triton.autotune(configs=_cfgs_dfea(), key=["L", "H"])
+@triton.autotune(configs=_cfgs_dfea(), key=["H"])
 @triton.jit
 def _edge_dfea_kernel(
     GO,
@@ -336,13 +336,19 @@ class EdgeDegreeOuterEdgeIndex_Fn(torch.autograd.Function):
 def prepare_edge_degree_outer_metadata(query_index, num_queries):
     query_index_i32 = query_index.contiguous().to(torch.int32)
     edge_index_i32 = torch.arange(query_index_i32.numel(), device=query_index_i32.device, dtype=torch.int32)
+    # Both segments are sorted by construction here: query_index is the graph's
+    # (ascending) query_idx and edge_index is an arange. Pass the hints so the
+    # metadata prep skips the _edge_index_is_sorted() .item() probe (a host sync
+    # + torch.compile graph break).
     metadata = prepare_sparse_qk_edge_index_metadata(
         query_index_i32,
         edge_index_i32,
         num_queries,
         edge_index_i32.numel(),
+        query_sorted=True,
+        neighbor_sorted=True,
     )
-    return metadata 
+    return metadata
 
 
 def edge_degree_outer_triton(edge_sh, edge_fea, query_index, num_queries, metadata=None):

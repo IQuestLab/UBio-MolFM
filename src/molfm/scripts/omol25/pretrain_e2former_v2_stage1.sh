@@ -7,7 +7,7 @@ export MKL_SERVICE_FORCE_INTEL=1
 export MKL_THREADING_LAYER='GNU'
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
 
 [ -z "${data_path}" ] && data_path="${PROJECT_ROOT}/data"
 [ -z "${data_path_list}" ] && data_path_list="${PROJECT_ROOT}/data/omol25/train_4M"
@@ -40,8 +40,7 @@ if [ -n "${swanlab_key}" ] && command -v swanlab >/dev/null 2>&1; then
   swanlab login -k "$swanlab_key"
 fi
 
-[ -z "${launcher}" ] && launcher='openmpi'
-[ -z "${hostfile}" ] && hostfile="${PROJECT_ROOT}/job/hostfile"
+# torchrun is used directly; no hostfile is required.
 [ -z "${MASTER_PORT}" ] && MASTER_PORT=62361
 [ -z "${MASTER_ADDR}" ] && MASTER_ADDR=127.0.0.1
 [ -z "${NNODES}" ] && NNODES=1
@@ -89,12 +88,12 @@ torchrun $DISTRIBUTED_ARGS src/molfm/tasks/pretrain_smallmol.py \
           log_interval=100 \
           wandb=$wandb \
           swanlab=$swanlab \
-          swanlab_project=lhuang_mfm \
+          swanlab_project=molfm \
           tb=$tb \
           tb_dir=$tb_dir \
           save_dir=$save_dir \
           ckpt_path="none" \
-          experiment_name=e2_0106_4x8_100M_4S_QKdot_atom2048 \
+          experiment_name="${experiment_name:-e2former_v2_stage1}" \
           gradient_accumulation_steps=$gradient_accumulation_steps \
           scheduler_config=groupWarmupDecayLR \
           strategy_config=ddp \

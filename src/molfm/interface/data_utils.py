@@ -44,6 +44,10 @@ def dict_to_model_input(
     ``pos_dtype`` exists for the GPU-native MD path, which keeps positions in
     float64 so that the integrator does not lose precision over long
     trajectories; the default float32 matches the training pipeline.
+
+    ``hoh_o_mask``, when a per-structure dict carries one, is forwarded so a
+    mixed-resolution checkpoint trained with ``lf_O_in_HOH=True`` routes water
+    oxygens to the light stream (``collate_fn`` pads the key with False).
     """
     out_list = []
     for data in data_list:
@@ -68,6 +72,14 @@ def dict_to_model_input(
             "atom_masks": torch.tensor([[True] * num_atoms]),
             "idx": 0,
         }
+
+        # Optional mixed-resolution light-routing mask. collate_fn pads
+        # "hoh_o_mask" (with False) and the E2former wrapper ORs it into
+        # is_light, so a caller that supplies one gets the same routing here as
+        # on the TorchAtoms fast path.
+        hoh = data.get("hoh_o_mask", None)
+        if hoh is not None and len(hoh) == num_atoms:
+            mol_data["hoh_o_mask"] = torch.as_tensor(hoh, dtype=torch.bool).reshape(-1)
 
         out_list.append(mol_data)
 

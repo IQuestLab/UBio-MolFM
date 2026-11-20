@@ -10,10 +10,11 @@ warnings.filterwarnings(
     category=UnsupportedFieldAttributeWarning,
 )
 
-from .models import E2FormerBackbone, E2FormerV2, E2FormerV2Backbone, E2former
+from .models import E2FormerBackbone, E2FormerV2, E2FormerV2Backbone, E2former, E2formerMR
 
 __all__ = [
     "E2former",
+    "E2formerMR",
     "E2FormerBackbone",
     "E2FormerV2",
     "E2FormerV2Backbone",

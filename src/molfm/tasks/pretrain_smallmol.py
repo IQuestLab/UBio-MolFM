@@ -27,7 +27,6 @@ from torch.optim.adamw import AdamW,Adam
 from loguru import logger 
 from molfm.logging.loggers import MetricLogger,get_logger
 from molfm.models.e2former.e2former_wrapper import E2FormerBackbone
-from molfm.models.e2former.maceblocks import MACE_Wrapper
 
 from molfm.utils.optimizer import get_scheduler
 
@@ -98,13 +97,11 @@ class SmallMolConfig(DistributedTrainConfig):
     scheduler_config: Dict[str, Any] = MISSING
     strategy_config: Dict[str, Any] = MISSING
     backbone: str = "e2former"
-    head_cfg_str: str = ""
-    
+
     data_path: str = ""
     data_path_list: str = ""
     data_path_list_valid: str = ""
     dataset_name_list: str = ""
-    dataset_name_list_valid: str = ""
     dataset_sample_prob: str = ""
     dataset_micro_batch_size: str = ""
     train_val_test_split: List[float] = field(
@@ -112,6 +109,14 @@ class SmallMolConfig(DistributedTrainConfig):
         default_factory=lambda: [0.95, 0.05, 0.0]
     )  # NOTE: This is only for MD data
     shuffle: bool = True
+    # DataLoader background workers PER RANK. 0 is the safe default: the fork
+    # path is a known latent hazard for the plain-.lmdb branch (see
+    # data/dataset.py _lmdb_env), so scripts must opt in explicitly.
+    num_workers: int = 0
+    # Route HOH water-O atoms through the mixed-resolution light branch by ORing
+    # the precomputed <db>.hoh_o_mask.npy sidecar into batched_data["is_light"].
+    # Only effective when backbone_config.mixed_resolution.enabled=True.
+    lf_O_in_HOH: bool = False
     save_dir: str = "./outputs"
     ckpt_path: str = "None"
 
@@ -123,7 +128,7 @@ class SmallMolConfig(DistributedTrainConfig):
     log_interval: int = 50
     val_batch_interval: int = 1000
     val_epoch_interval: int = 0
-    
+
     with_moe: str = "None"
     energy_loss_weight: float = 0.01
     force_loss_weight: float = 0.99
@@ -132,7 +137,6 @@ class SmallMolConfig(DistributedTrainConfig):
     # vsc_debug: bool = False
 
     lr: float = 0.0001
-    custom_factors: str = ""
     clip_grad_norm: float = 5
     AutoGradForce: bool = True
     gradient_accumulation_steps: int = 1
@@ -373,14 +377,10 @@ def finetune(cfg: DictConfig) -> None:
     
 
 
-    parts = args.custom_factors.split(",")                       # ["svp","10","tzvpd","20"]
-    custom_factors = [(parts[2*i], float(parts[2*i+1]))     
-            for i in range(0, len(parts)//2)]
-    
     impl = Adam if args.weight_decay == 0 else AdamW
-    param_groups = build_param_groups(model, base_lr=args.lr, weight_decay=args.weight_decay,
-                                    custom_factors=custom_factors #[("svp",10),("tzvpd",10)]
-                                    )
+    param_groups = build_param_groups(
+        model, base_lr=args.lr, weight_decay=args.weight_decay
+    )
     optimizer = impl(param_groups, lr=args.lr, betas=(0.9, 0.999), eps=1e-8,
                     weight_decay=args.weight_decay)
     lr_scheduler = get_scheduler(optimizer,

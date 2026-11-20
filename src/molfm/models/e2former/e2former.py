@@ -835,7 +835,6 @@ class E2former(torch.nn.Module):
         else:
             raise ValueError
         Jd_list =  torch.load(os.path.join(os.path.dirname(__file__), 'Jd.pt'))
-        # torch.load("/volume_flash/code/lhuang/MolFM/molfm/models/equivariant/uma/Jd.pt")
         self.Jd_list = nn.ParameterList([nn.Parameter(i.float(),requires_grad=False) for i in Jd_list])
 
         self.edge_deg_embed_dense = EdgeDegreeEmbeddingNetwork_higherorder(

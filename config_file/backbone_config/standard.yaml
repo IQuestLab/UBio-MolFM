@@ -1,0 +1,61 @@
+# Hydra backbone config for Standard.
+#
+# Training:
+#   torchrun ... src/molfm/tasks/pretrain_smallmol.py \
+#       --config-name=config_molfm.yaml backbone_config=standard ...
+#
+# The matching flattened inference config is
+# config_file/examples/standard.yaml.
+
+name: e2former
+encoder_embed_dim: 1024
+ffn_embedding_dim: 1536
+num_attention_heads: 32
+dropout: 0.1
+num_encoder_layers: 12
+pbc_expanded_token_cutoff: 256
+pbc_expanded_num_cell_per_direction: 1
+num_layers: 6
+irreps_node_embedding: "256x0e+256x1e+256x2e"
+irreps_head: "2x0e+2x1e+2x2e"
+attn_scalar_head: 8
+num_attn_heads: 128
+number_of_basis: 256
+max_radius: 6
+max_neighbors: null
+alpha_drop: 0.0
+basis_type: gaussiansmear
+norm_layer: rms_norm_sh
+attn_type: zero-order
+tp_type: QKdotS_alpha+softplus+triton
+edge_embedtype: default
+ffn_type: s2
+encoder: default
+with_cluster: false
+ffn_hidden_multiplier: 1
+ffn_grid_resolution: 12
+layerwise_shared_KV_cache: false
+normalized_radial_profile: true
+
+# Standard concatenates the outputs of blocks 3 and 6 before the head.
+cat_layer_output: true
+cat_layer_indices: [3, 6]
+
+mixed_resolution:
+  enabled: true
+  irreps_light_embedding: "64x0e"
+  lf_atoms: [1]
+  light_attn_heads: 4
+  light_attn_scalar_head: 16
+  light_ffn_grid_resolution: null
+  cross_mode: interleaved
+  cross_mode_list: [A2H, A2H, H2A, A2H, A2H, H2A]
+  interleaved_tail: v1
+  flash_up_proj: linear
+  a2h_kv_union: true
+  a2h_kv_union_max_ratio: 0.9
+  light_angular_basis: 0
+  light_angular_zeta_cnt: 4
+  light_angular_eta: 1.0
+  energy_head: distinct
+  r_cross: null

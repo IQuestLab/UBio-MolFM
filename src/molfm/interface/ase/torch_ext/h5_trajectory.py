@@ -1,7 +1,3 @@
-# Description: Async HDF5 trajectory writer for big-data (GB-scale per frame).
-# Supports non-blocking GPU-to-CPU transfer and FP32 compression.
-# Contributor note: hardened with append-only commit tracking,
-# crash recovery, and safer file close semantics.
 
 import os
 import numpy as np
@@ -67,9 +63,6 @@ class H5Trajectory:
             else:
                 self.file.create_dataset('atomic_numbers', data=np.array([], dtype=int))
                 self.file.create_dataset('pbc', data=np.array([False, False, False]))
-        if self.append_only:
-            self._init_append_state()
-
         # Create or fetch resizable datasets (skip creation in read-only mode)
         if natoms <= 0:
             natoms = self.file['atomic_numbers'].shape[0] if 'atomic_numbers' in self.file else 0
@@ -96,6 +89,7 @@ class H5Trajectory:
                     self.file['steps'].resize(n_main, axis=0)
 
         if self.append_only:
+            self._init_append_state()
             self._recover_append_state()
 
         # Async Setup: Producer-Consumer via Threading (write modes only)
@@ -176,9 +170,17 @@ class H5Trajectory:
         return broken_name
 
     def _init_append_state(self):
-        """Initialize append-only state metadata."""
+        """Initialize append-only state without discarding legacy frames."""
         if "append_committed_frames" not in self.file.attrs:
-            self.file.attrs["append_committed_frames"] = 0
+            dataset_names = ["positions", "velocities", "forces", "energies", "cells", "steps"]
+            lengths = {name: int(self.file[name].shape[0]) for name in dataset_names}
+            if len(set(lengths.values())) != 1:
+                self.file.close()
+                raise RuntimeError(
+                    f"Cannot infer committed frames for {self.filename}: "
+                    f"dataset lengths differ: {lengths}"
+                )
+            self.file.attrs["append_committed_frames"] = next(iter(lengths.values()), 0)
 
     def _recover_append_state(self):
         """Truncate any partially written tail after a crash."""
@@ -189,8 +191,16 @@ class H5Trajectory:
             committed = present_lengths[0] if present_lengths and len(set(present_lengths)) == 1 else 0
         else:
             committed = int(stored_committed)
-            if present_lengths:
-                committed = min(committed, min(present_lengths))
+            if committed < 0 or any(length < committed for length in present_lengths):
+                lengths = {
+                    name: int(self.file[name].shape[0])
+                    for name in dataset_names if name in self.file
+                }
+                self.file.close()
+                raise RuntimeError(
+                    f"Invalid append_committed_frames={committed} for "
+                    f"{self.filename}: dataset lengths {lengths}"
+                )
 
         if present_lengths:
             current_max = max(present_lengths)
@@ -288,7 +298,7 @@ class H5Trajectory:
 
         Each key gets its own f8 dataset of shape (nframes,). A key first seen at
         frame_index>0 is backfilled with NaN for all prior frames so every info
-        series is aligned to the trajectory frame index. Runs in the writer thread only.
+        series is aligned to the global frame index. Runs in the writer thread only.
         """
         grp = self.file.require_group("info")
         for key, val in info.items():
@@ -395,7 +405,7 @@ class H5Trajectory:
 
     @staticmethod
     def truncate_to_step(filepath: str, target_step: int,
-                        full_sync_interval: int = None) -> int:
+                        global_sync_interval: int = None) -> int:
         """Truncate an existing H5 trajectory to *target_step* (inclusive).
 
         Finds the largest frame whose step ≤ *target_step*, resizes every
@@ -403,7 +413,7 @@ class H5Trajectory:
 
         When the trajectory has a ``steps`` dataset (new format) the per-frame
         step values are used directly.  For legacy files without ``steps``,
-        step is inferred as ``frame_index * full_sync_interval`` — *full_sync_interval*
+        step is inferred as ``frame_index * global_sync_interval`` — *global_sync_interval*
         must be provided in that case.
 
         Returns:
@@ -425,22 +435,22 @@ class H5Trajectory:
                         f"No frame found with step <= {target_step} in {filepath}"
                     )
                 keep_idx = int(np.flatnonzero(mask)[-1])
-            elif full_sync_interval is not None:
-                # Legacy file: infer step = frame_index * full_sync_interval.
-                # Frame 0 = initial state (step 0), frame k = step k * full_sync_interval.
-                # Find the largest frame index where k * full_sync_interval <= target_step.
-                keep_idx = target_step // full_sync_interval
+            elif global_sync_interval is not None:
+                # Legacy file: infer step = frame_index * global_sync_interval.
+                # Frame 0 = initial state (step 0), frame k = step k * global_sync_interval.
+                # Find the largest frame index where k * global_sync_interval <= target_step.
+                keep_idx = target_step // global_sync_interval
                 if keep_idx >= n_frames:
                     keep_idx = n_frames - 1
                 if keep_idx < 0:
                     raise ValueError(
                         f"target_step={target_step} too small for "
-                        f"full_sync_interval={full_sync_interval} in {filepath}"
+                        f"global_sync_interval={global_sync_interval} in {filepath}"
                     )
             else:
                 raise ValueError(
                     f"Trajectory {filepath} has no 'steps' dataset and no "
-                    f"full_sync_interval was provided. Cannot truncate by step."
+                    f"global_sync_interval was provided. Cannot truncate by step."
                 )
             new_len = keep_idx + 1
 
@@ -453,13 +463,18 @@ class H5Trajectory:
             return new_len
 
     @staticmethod
-    def read_last_frame(filepath: str) -> Dict[str, Any]:
+    def read_last_frame(filepath: str, committed_only: bool = False) -> Dict[str, Any]:
         """Read the last frame of an H5 trajectory and return a self-contained dict.
 
         Opens the file read-only with crash recovery.  ``cell``, ``pbc``, and
         ``numbers`` are guaranteed non-None (defaults are filled when the H5
         lacks the dataset).  ``positions``, ``velocities``, and ``steps`` may
         be None for empty files or legacy files without those datasets.
+
+        When ``committed_only`` is true, the selected restart frame is bounded
+        by the durable ``append_committed_frames`` marker. A legacy file without
+        that marker is accepted only when all six per-frame datasets have the
+        same length; that common length is then the safe committed boundary.
 
         Returns:
             Dict with keys: ``positions``, ``velocities``, ``cell``,
@@ -491,14 +506,39 @@ class H5Trajectory:
 
         with f:
             n_frames = f["positions"].shape[0] if "positions" in f else 0
+            frame_index = n_frames - 1
+            if committed_only:
+                required = ("positions", "velocities", "forces", "energies", "cells", "steps")
+                missing = [name for name in required if name not in f]
+                if missing:
+                    raise RuntimeError(
+                        f"Trajectory {filepath} is missing committed datasets: {missing}"
+                    )
+                lengths = {name: int(f[name].shape[0]) for name in required}
+                if "append_committed_frames" in f.attrs:
+                    committed = int(f.attrs["append_committed_frames"])
+                elif len(set(lengths.values())) == 1:
+                    committed = next(iter(lengths.values()), 0)
+                else:
+                    raise RuntimeError(
+                        f"Trajectory {filepath} has no commit marker and its "
+                        f"dataset lengths differ: {lengths}"
+                    )
+                if committed < 0 or any(length < committed for length in lengths.values()):
+                    raise RuntimeError(
+                        f"Trajectory {filepath} has invalid commit marker {committed} "
+                        f"for dataset lengths {lengths}"
+                    )
+                n_frames = committed
+                frame_index = committed - 1
 
-            positions = f["positions"][-1] if n_frames > 0 else None
-            velocities = f["velocities"][-1] if "velocities" in f and n_frames > 0 else None
+            positions = f["positions"][frame_index] if n_frames > 0 else None
+            velocities = f["velocities"][frame_index] if "velocities" in f and n_frames > 0 else None
 
             # Self-contained metadata: always present or filled with defaults.
             cell = np.zeros((3, 3), dtype=np.float64)
-            if "cells" in f and f["cells"].shape[0] == n_frames and n_frames > 0:
-                cell = f["cells"][-1].astype(np.float64)
+            if "cells" in f and n_frames > 0 and f["cells"].shape[0] > frame_index:
+                cell = f["cells"][frame_index].astype(np.float64)
 
             numbers = np.array([], dtype=int)
             if "atomic_numbers" in f:
@@ -512,8 +552,8 @@ class H5Trajectory:
                 pbc = pbc_val
 
             steps = None
-            if "steps" in f and f["steps"].shape[0] == n_frames and n_frames > 0:
-                raw = f["steps"][-1]
+            if "steps" in f and n_frames > 0 and f["steps"].shape[0] > frame_index:
+                raw = f["steps"][frame_index]
                 try:
                     steps = int(raw)
                 except (TypeError, ValueError):

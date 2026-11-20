@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import dataclasses
 import gc
 import os
 from pathlib import Path
@@ -203,6 +204,18 @@ class E2FormerModelInterface:
     def _load_config_and_metadata(self):
         with open(self.config_file, "r", encoding="utf-8") as f:
             raw_cfg = yaml.safe_load(f)
+        # Released checkpoints were flattened from a full training config, which
+        # can carry fields this inference release no longer defines (e.g. the
+        # retired stage-3 training knobs). Drop them with a warning instead of
+        # failing with a TypeError on an otherwise usable checkpoint.
+        known = {f.name for f in dataclasses.fields(SmallMolConfig)}
+        unknown = sorted(set(raw_cfg) - known)
+        if unknown:
+            logger.warning(
+                f"Ignoring {len(unknown)} config key(s) not used by this release: "
+                f"{unknown}"
+            )
+            raw_cfg = {k: v for k, v in raw_cfg.items() if k in known}
         self.model_cfg = SmallMolConfig(**raw_cfg)
         self.max_radius = self.model_cfg.backbone_config["max_radius"]
 

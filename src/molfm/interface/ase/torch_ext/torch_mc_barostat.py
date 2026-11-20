@@ -1,10 +1,3 @@
-# Description: Energy-only isotropic Monte-Carlo barostat for the GPU-native ASE
-#              stack. E2Former predicts only energy + forces (no stress/virial),
-#              so a differential barostat is impossible; an MC volume move needs
-#              only get_potential_energy(). Volume moves are random walks in ln V;
-#              molecular centres of mass are scaled (NOT every atom — that would
-#              distort intramolecular bonds of the flexible all-atom water model
-#              and collapse the acceptance ratio).
 
 import math
 from typing import Optional, Tuple
@@ -42,6 +35,8 @@ def build_molecule_index(
                 minimum-image bond search; assumes an (approximately) orthorhombic
                 cell, which is the case for the cubic solvent boxes used here.
     source    : "auto"/"bondgraph" -> distance bond graph + connected components;
+                "water_ions"       -> the same covalent graph, but Na and Cl are
+                                     forced to remain monatomic components;
                 "stride:N"        -> every N consecutive atoms form one molecule
                                      (e.g. "stride:3" for pre-ordered O,H,H water);
                 "residue"         -> not available from TorchAtoms; falls back to
@@ -63,7 +58,7 @@ def build_molecule_index(
             raise ValueError(f"stride:{k} does not divide N={n}")
         return (np.arange(n) // k).astype(np.int64)
 
-    if source not in ("auto", "bondgraph", "residue"):
+    if source not in ("auto", "bondgraph", "residue", "water_ions"):
         raise ValueError(f"Unknown molecule_source: {source!r}")
     if source == "residue":
         logger.warning(
@@ -89,6 +84,19 @@ def build_molecule_index(
         d = np.linalg.norm(dvec, axis=1)
         thr = rcov[pairs[:, 0]] + rcov[pairs[:, 1]] + tol
         keep = (d < thr) & (d > 0.4)
+        if source == "water_ions":
+            # Na--O hydration contacts are commonly 2.2--2.5 A, below the
+            # covalent-radius heuristic used by the generic bond graph
+            # (r_Na + r_O + tol = 2.62 A here). They are not covalent bonds and
+            # must not fuse ions with one or more waters for molecular-COM volume
+            # scaling or for the N_mol Jacobian. Chloride is kept monatomic for
+            # the same explicit aqueous-NaCl contract. This source is opt-in so
+            # generic organochlorine systems retain normal bond perception.
+            monatomic_ions = np.isin(numbers, (11, 17))
+            keep &= ~(
+                monatomic_ions[pairs[:, 0]]
+                | monatomic_ions[pairs[:, 1]]
+            )
         pairs = pairs[keep]
 
     if len(pairs) == 0:
@@ -124,14 +132,37 @@ def build_molecule_index(
 
 
 class TorchMCBarostat:
-    """Isotropic energy-only Monte-Carlo barostat (ln-V moves, COM scaling).
+    """Energy-only Monte-Carlo barostat (ln-V moves, COM scaling).
 
-    The orchestration of the in-place trial move lives in
-    ``ASERunner._mc_barostat_attempt``. This class owns only: the proposal RNG,
-    the COM-preserving position scaling, and the Metropolis acceptance test.
-    All physics quantities are in ASE units
+    Two coupling geometries are supported via ``mode``:
+
+    ``"isotropic"`` (default)
+        A single scale factor is applied to all three axes, so the box can only
+        breathe — its aspect ratio is mathematically frozen. Correct for bulk
+        fluids (the case this barostat was written for).
+
+    ``"semiiso"``
+        Tensionless-membrane coupling. Each attempt is randomly either an
+        **area move** (x and y scaled together, z fixed) or a **thickness move**
+        (z scaled, x and y fixed). Giving the lateral and normal directions
+        independent degrees of freedom is what lets a bilayer relax to zero
+        surface tension. **Required for membranes**: under ``"isotropic"`` the
+        area per lipid is pinned at its input value and the bilayer can only
+        respond to any area/thickness mismatch by deforming internally
+        (collective chain tilt, thinning, water entering the hydrophobic core).
+
+    Both move types are drawn with the same ln-volume step, so ``V_new/V_old =
+    exp(delta)`` either way and the Metropolis test below is unchanged (at zero
+    applied surface tension the tension term vanishes).
+
+    The orchestration of data movement (single-GPU, in place) lives in
+    ``ASERunner._mc_barostat_attempt``. This class owns
+    only: the proposal RNG, the COM-preserving position scaling, and the
+    Metropolis acceptance test. All physics quantities are in ASE units
     (energy eV, length Angstrom, pressure eV/Angstrom^3 via ``units.bar``).
     """
+
+    MODES = ("isotropic", "semiiso")
 
     def __init__(
         self,
@@ -142,19 +173,31 @@ class TorchMCBarostat:
         mol_first_atom: Optional[torch.Tensor] = None,
         masses: Optional[torch.Tensor] = None,
         dlnV: float = 0.002,
+        dlnV_z: Optional[float] = None,
         seed: int = 12345,
         device: str = "cuda:0",
         dtype: torch.dtype = torch.float64,
+        mode: str = "isotropic",
     ):
+        if mode not in self.MODES:
+            raise ValueError(f"barostat mode must be one of {self.MODES}, got {mode!r}")
+        self.mode = mode
         self.P = float(pressure_bar) * units.bar            # eV / Angstrom^3
         self.kT = units.kB * float(temperature_K)           # eV
         self.n_mol = int(n_mol)
         self.dlnV = float(dlnV)
+        # Thickness moves need their own step size. For the same ln-V step the
+        # per-axis strain is delta/2 for an area move but delta for a thickness
+        # move, so sharing one dlnV makes z-moves ~2x larger and they get
+        # rejected almost always (observed: 0/10 accepted at dlnV=0.002 on a
+        # POPE:POPG bilayer). Default to dlnV/2 -> equal per-axis strain.
+        self.dlnV_z = float(dlnV_z) if dlnV_z is not None else 0.5 * float(dlnV)
         self.device = device
         self.dtype = dtype
         self._rng = np.random.default_rng(seed)
 
-        # Per-atom scaling data.
+        # Per-atom scaling data (only needed where global scaling is performed:
+        # the single process).
         self.mol_index = mol_index
         self.mol_first_atom = mol_first_atom
         self.masses = masses
@@ -163,13 +206,61 @@ class TorchMCBarostat:
         self.n_acc = 0
 
     # ------------------------------------------------------------------
-    # Proposal + acceptance
+    # Proposal + acceptance (the single process draws)
     # ------------------------------------------------------------------
     def propose(self) -> Tuple[float, float]:
         """Draw a ln-volume step and a uniform acceptance number."""
         delta = float(self._rng.uniform(-self.dlnV, self.dlnV))
         u = float(self._rng.random())
         return delta, u
+
+    def propose_move(self) -> Tuple[float, float, int]:
+        """Draw (ln-volume step, acceptance number, move kind) in one call.
+
+        The step size is per move type, so the area and thickness degrees of
+        freedom can each be tuned to a reasonable acceptance ratio. ``delta`` is
+        always the ACTUAL ln-volume change of the returned move, which is what
+        :meth:`accept` and the caller's ``V_new`` rely on.
+
+        In ``isotropic`` mode the RNG is consumed in exactly the pre-change order
+        (delta, then u) so old trajectories remain bit-reproducible.
+        """
+        if self.mode == "isotropic":
+            delta = float(self._rng.uniform(-self.dlnV, self.dlnV))
+            u = float(self._rng.random())
+            return delta, u, 0
+        kind = int(self._rng.integers(0, 2))
+        amp = self.dlnV if kind == 0 else self.dlnV_z
+        delta = float(self._rng.uniform(-amp, amp))
+        u = float(self._rng.random())
+        return delta, u, kind
+
+    def propose_kind(self) -> int:
+        """Draw the move type for ``semiiso`` (0 = area/xy, 1 = thickness/z).
+
+        Always 0 in ``isotropic`` mode. Kept separate from :meth:`propose` so
+        the caller can pass it alongside (delta, u) and obtain the *same* scale
+        vector through :meth:`scale_vector`.
+        """
+        if self.mode == "isotropic":
+            return 0
+        return int(self._rng.integers(0, 2))
+
+    def scale_vector(self, delta: float, kind: int) -> Tuple[float, float, float]:
+        """Per-axis scale factors for a ln-volume step ``delta``.
+
+        Pure function of (delta, kind, mode) so it is deterministic and needs no
+        extra communication. Every branch satisfies
+        ``sx * sy * sz == exp(delta)``, which is what :meth:`accept` assumes.
+        """
+        if self.mode == "isotropic":
+            s = math.exp(delta / 3.0)
+            return (s, s, s)
+        if kind == 0:                       # area move: x,y together; z fixed
+            sxy = math.exp(delta / 2.0)
+            return (sxy, sxy, 1.0)
+        sz = math.exp(delta)                # thickness move: z only
+        return (1.0, 1.0, sz)
 
     def accept(self, dE: float, V_old: float, V_new: float, u: float) -> bool:
         """Metropolis criterion for an ln-V move.
@@ -197,11 +288,26 @@ class TorchMCBarostat:
         return self.n_acc / max(1, self.n_try)
 
     # ------------------------------------------------------------------
-    # COM-preserving isotropic scaling of the full configuration
+    # COM-preserving isotropic scaling of a GLOBAL configuration
     # ------------------------------------------------------------------
-    def scale_positions(self, pos: torch.Tensor, s: float, cell: torch.Tensor) -> torch.Tensor:
+    def _scale_tensor(self, s) -> torch.Tensor:
+        """Normalise a scalar or length-3 scale into a (1,3) broadcasting tensor."""
+        if isinstance(s, (int, float)):
+            s = (float(s),) * 3
+        s = tuple(float(x) for x in s)
+        if len(s) != 3:
+            raise ValueError(f"scale must be a scalar or length-3, got {s!r}")
+        return torch.tensor(s, device=self.device, dtype=self.dtype).unsqueeze(0)
+
+    def scale_positions(self, pos: torch.Tensor, s, cell: torch.Tensor) -> torch.Tensor:
         """Scale every molecule's centre of mass by ``s`` about the cell origin,
         keeping each molecule's internal geometry rigid.
+
+        ``s`` is either a scalar (isotropic) or a length-3 per-axis factor
+        ``(sx, sy, sz)`` (semi-isotropic). Per-axis scaling multiplies Cartesian
+        component j of every lattice vector and of every COM by ``s[j]``, which
+        for the orthorhombic cells used here is exactly an independent rescaling
+        of the box edges.
 
         Molecules are first unwrapped (minimum image relative to their first
         atom, in fractional coordinates — valid for molecules whose intramolecular
@@ -229,7 +335,8 @@ class TorchMCBarostat:
         den.index_add_(0, self.mol_index, mass)
         com = num / den                                     # (n_mol, 3)
 
-        new_pos = pos_uw + (s - 1.0) * com[self.mol_index]
+        s_vec = self._scale_tensor(s)                       # (1, 3)
+        new_pos = pos_uw + (s_vec - 1.0) * com[self.mol_index]
 
         # Wrap back into the SCALED cell. After COM scaling the atoms can lie
         # outside [0, L); leaving them there makes the E2Former FAISS neighbour
@@ -237,7 +344,7 @@ class TorchMCBarostat:
         # WRONG energy — the original cause of spurious runaway compression.
         # Per-atom wrap is PBC-exact; split molecules are handled by the
         # calculator's cell expansion. The COM-scaling (volume move) is preserved.
-        new_cell = cell * s
+        new_cell = cell * s_vec
         inv_new = torch.linalg.inv(new_cell)
         frac = new_pos @ inv_new
         frac = frac - torch.floor(frac)                     # wrap to [0, 1)

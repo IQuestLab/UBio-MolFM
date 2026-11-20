@@ -12,7 +12,7 @@
 # `ase_atom_to_dict` / `dict_to_model_input` live in molfm.interface.data_utils and
 # are re-exported below for backwards compatibility.
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
@@ -57,6 +57,11 @@ class E2FormerCalculator(Calculator, E2FormerModelInterface):
         multiplicity: int = 1,
         **kwargs,
     ):
+        if "use_special_mode" in kwargs:
+            raise TypeError(
+                "use_special_mode has been removed from this release; it silently "
+                "overrode the mixed-resolution energy-head selection."
+            )
         super().__init__(
             restart=restart,
             ignore_bad_restart=ignore_bad_restart,
@@ -70,6 +75,12 @@ class E2FormerCalculator(Calculator, E2FormerModelInterface):
         self.add_ref_energy = add_ref_energy
         self.charge = charge
         self.multiplicity = multiplicity
+
+        # Optional per-atom bool mask [N] marking atoms to additionally route to the
+        # mixed-resolution LIGHT stream (e.g. water oxygens for models trained with
+        # lf_O_in_HOH=True). TorchAtoms carries no residue names, so the caller sets
+        # this explicitly; left None it is a no-op (only lf_atoms, i.e. H, go light).
+        self.hoh_o_mask = None
         E2FormerModelInterface.__init__(
             self,
             config_path=config_path,
@@ -167,6 +178,13 @@ class E2FormerCalculator(Calculator, E2FormerModelInterface):
                 "atom_masks": torch.tensor([[True] * num_atoms], device=device),
                 "idx": 0,
             }
+            # Forward the optional HOH-O (light-routing) mask when its length matches
+            # this structure. collate_fn pads "hoh_o_mask" (with False) and the
+            # E2former wrapper ORs it into is_light for mixed-resolution models.
+            if self.hoh_o_mask is not None and len(self.hoh_o_mask) == num_atoms:
+                mol_data["hoh_o_mask"] = torch.as_tensor(
+                    self.hoh_o_mask, dtype=torch.bool, device=device
+                ).reshape(-1)
             out_list.append(mol_data)
 
         out_batch = collate_fn(out_list)
@@ -222,6 +240,15 @@ class E2FormerCalculator(Calculator, E2FormerModelInterface):
         data_list = []
         for atoms in atoms_list:
             data_dict = ase_atom_to_dict(atoms)
+            data_dict["charge"] = self.charge
+            data_dict["multiplicity"] = self.multiplicity
+            # Forward the optional HOH-O (light-routing) mask, exactly as the TorchAtoms
+            # fast path does in _prepare_torch_input. Without this a mixed-resolution
+            # checkpoint driven through the plain ASE Calculator API (get_potential_energy,
+            # ase.optimize, NEB, ...) silently routes every water oxygen HEAVY while the
+            # same structure through TorchAtoms routes it LIGHT -- two different models.
+            if self.hoh_o_mask is not None and len(self.hoh_o_mask) == len(atoms):
+                data_dict["hoh_o_mask"] = np.asarray(self.hoh_o_mask, dtype=bool)
             if force_use_aperiodic or self.force_use_aperiodic:
                 data_dict["cell"] = torch.zeros((3, 3), dtype=torch.float32)
                 data_dict["pbc"] = torch.tensor([0, 0, 0], dtype=torch.int32)

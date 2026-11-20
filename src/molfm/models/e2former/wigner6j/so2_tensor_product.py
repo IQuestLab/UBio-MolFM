@@ -2,6 +2,7 @@
 
 from e3nn import o3
 from itertools import groupby
+import os
 import torch
 from torch import nn
 import random
@@ -403,7 +404,7 @@ def test_so2_o1():
                                 out_c=128,
                                 drop_path=True,
                                 with_linear = True)
-    Jd_list = torch.load("/volume_flash/code/lhuang/MolFM/molfm/models/equivariant/uma/Jd.pt")
+    Jd_list = torch.load(os.path.join(os.path.dirname(__file__), "..", "Jd.pt"))
     Jd_list = [i.float() for i in Jd_list]
 
     N = 10
@@ -529,7 +530,7 @@ def test_so2_o2():
     from torch import nn
     from molfm.models.e2former.module_utils import init_edge_rot_euler_angles,eulers_to_wigner # 
 
-    Jd_list =  torch.load("/volume_flash/code/lhuang/MolFM/molfm/models/equivariant/uma/Jd.pt")
+    Jd_list =  torch.load(os.path.join(os.path.dirname(__file__), "..", "Jd.pt"))
     Jd_list = nn.ParameterList([nn.Parameter(i.float(),requires_grad=False) for i in Jd_list])
     lmax = 2
     N = 10

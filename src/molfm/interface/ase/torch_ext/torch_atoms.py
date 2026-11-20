@@ -1,4 +1,3 @@
-# Description: Pure torch Atoms class for fully GPU-driven MD.
 
 import copy
 from typing import Sequence

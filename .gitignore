@@ -2,6 +2,9 @@ __pycache__/
 *.log
 *.whl
 *.png
+# Figures referenced by README.md
+!docs/figures/*.png
 *.pyc
 runs/
 .vscode
+outputs/

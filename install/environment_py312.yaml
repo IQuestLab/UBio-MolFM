@@ -44,8 +44,14 @@ dependencies:
       - ase_db_backends
       - rdkit
       - wandb==0.21.0
+      - aim==3.29.1
       - nequip-allegro==0.7.0
-      # - fairchem-core --no-deps
+      # fairchem-core: required by the s2 / spectral mixed-resolution FFN
+      # (molfm.models.e2former.uma_utils). Not listed here because its torch
+      # pin conflicts with the pinned torch; install it after the env is
+      # created:
+      #   pip install --no-deps fairchem-core==2.4.0
+      # Only its `uma.nn` activation/SO3 layers are used.
       - pymatgen
       # Neighbour search on GPU (backbone use_faiss=True, the default).
       - faiss-gpu==1.14.3
@@ -54,3 +60,8 @@ dependencies:
       - h5py
       - fire
       - MDAnalysis
+      # Experiment tracking used by the training entry point (optional at
+      # inference time: the ASE runner falls back to no tracking if absent).
+      - swanlab
+      # KMeans node clustering in the mixed-resolution backbone's cluster path.
+      - scikit-learn
