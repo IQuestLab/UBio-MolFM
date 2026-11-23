@@ -3,6 +3,7 @@
 > **Note**: This is the latest repository of **UBio-MolFM**, which also includes code and research from previous versions. 
 > - **E2Former-LSR**: Scalable Machine Learning Force Fields through Long-Range Aware Message Passing ([arXiv:2601.03774](https://arxiv.org/abs/2601.03774) | [Code Release: E2Former-LSR](https://github.com/IQuestLab/UBio-MolFM/releases/tag/E2Former-LSR))
 > - **E2Former-V2**: On-the-Fly Equivariant Attention with Linear Activation Memory ([arXiv:2601.16622](https://arxiv.org/abs/2601.16622) | [Code Release: E2Former-V2](https://github.com/IQuestLab/UBio-MolFM/releases/tag/E2Former-V2))
+> - **E2Former-V3**: Atom-Role-Aware Equivariant Interatomic Potentials ([arXiv:2611.27111](https://arxiv.org/abs/2611.27111))
 > - **UBio-MolFM-V1**: Universal Molecular Foundation Model for Bio-Systems ([arXiv:2602.17709](https://arxiv.org/abs/2602.17709))
 > - **UBio-MolFM-V1.5**: Enabling Biomolecular Dynamics at DFT Accuracy and 10⁵ Atoms with One Untuned Potential ([arXiv:2608.18623](https://arxiv.org/abs/2608.18623)) | Current repository
 
@@ -31,6 +32,8 @@ UBio-MolFM is a foundation model suite for molecular modeling, developed by the 
 - [License](#license)
 
 ## What's New in E2Former-V3
+
+**Paper**: [E2Former-V3: Atom-Role-Aware Equivariant Interatomic Potentials](https://arxiv.org/abs/2611.27111)
 
 E2Former-V3 is an **atom-role-aware** equivariant potential. Instead of giving every atom the
 same latent width and the same number of block updates, a static chemical role is assigned
@@ -561,6 +564,7 @@ the checkpoint when running released weights.
 
 For more details on the methodology and architecture, see the associated papers:
 
+- **E2Former-V3: Atom-Role-Aware Equivariant Interatomic Potentials** (2026): [arXiv:2611.27111](https://arxiv.org/abs/2611.27111)
 - **UBio-MolFM: Enabling Biomolecular Dynamics at DFT Accuracy and 10⁵ Atoms with One Untuned Potential** (2026): [arXiv:2608.18623](https://arxiv.org/abs/2608.18623)
 - **UBio-MolFM: A Universal Molecular Foundation Model for Bio-Systems** (2026): [arXiv:2602.17709](https://arxiv.org/abs/2602.17709)
 - **E2Former-V2: On-the-Fly Equivariant Attention with Linear Activation Memory** (2026): [arXiv:2601.16622](https://arxiv.org/abs/2601.16622)
@@ -571,9 +575,19 @@ For more details on the methodology and architecture, see the associated papers:
 
 The `Related Work` section lists the main papers and release references, while this section provides the recommended citation format for academic use.
 
-If you use UBio-MolFM or E2Former-V2 in your research, please cite the following:
+If you use UBio-MolFM, E2Former-V2, or E2Former-V3 in your research, please cite the following:
 
 ```bibtex
+@misc{peng2026e2formerv3atomroleawareequivariantinteratomic,
+      title={E2Former-V3: Atom-Role-Aware Equivariant Interatomic Potentials}, 
+      author={Frank Peng and Lin Huang and Arthur Jiang and Jia Zhang},
+      year={2026},
+      eprint={2611.27111},
+      archivePrefix={arXiv},
+      primaryClass={physics.chem-ph},
+      url={https://arxiv.org/abs/2611.27111}, 
+}
+
 @techreport{huang2026ubiomolfm1p5,
       title={UBio-MolFM: Enabling Biomolecular Dynamics at DFT Accuracy and 10^5 Atoms with One Untuned Potential}, 
       author={Lin Huang and Frank Peng and JiaJun Cheng and Zion Wang and Hao Yin and Hao Li and Ji Zhang and Jack Jia and Junping Zhao and Arthur Jiang and Jia Zhang},
